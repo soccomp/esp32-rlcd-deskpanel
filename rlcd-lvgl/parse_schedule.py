@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-parse_schedule.py — 神舟传媒一周会议日程表 解析 & API 服务
+parse_schedule.py — 会议日程表 解析 & API 服务
 
 功能：
   1. 从图片/PDF 提取会议数据 → 结构化 JSON（schedule.json）
@@ -33,7 +33,7 @@ import html as _html
 import xml.etree.ElementTree as ET
 
 # ============================================================
-#  数据源：从「神舟传媒一周主要会议日程表」图片手工提取
+#  数据源：从「一周主要会议日程表」图片手工提取（已脱敏，见下方示例数据）
 #  原始文档：2026年7月27日—2026年8月2日  第2版
 # ============================================================
 
@@ -894,7 +894,7 @@ def load_source_from_file(filepath: str = None) -> str:
             return src
     except (FileNotFoundError, json.JSONDecodeError):
         pass
-    return "神舟传媒一周主要会议日程表"
+    return "一周主要会议日程表"
 
 
 def build_schedule_json(target_name: str = "你的姓名", city: str = None) -> dict:
@@ -986,7 +986,7 @@ def create_app(target_name: str = "你的姓名", city: str = "北京"):
     import uvicorn
 
     app = FastAPI(
-        title="神舟传媒会议日程 API",
+        title="会议日程 API",
         description="为 ESP32-S3 RLCD 桌面面板提供会议日程 + 天气数据",
         version="1.1.0",
     )
@@ -1146,7 +1146,7 @@ def create_app(target_name: str = "你的姓名", city: str = "北京"):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="神舟传媒会议日程表 解析 & API 服务",
+        description="会议日程表 解析 & API 服务",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
@@ -1198,7 +1198,7 @@ def main():
     output_path = args.output or "./schedule.json"
     saved = save_schedule_json(output_path, args.name)
     print(f"=" * 55)
-    print(f"  神舟传媒会议日程 API 服务")
+    print(f"  会议日程 API 服务")
     print(f"=" * 55)
     print(f"  目标姓名 : {args.name}")
     print(f"  天气城市 : {args.city}")

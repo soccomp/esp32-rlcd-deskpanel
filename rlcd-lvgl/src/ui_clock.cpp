@@ -9,7 +9,7 @@
 /* LVGL 内置字体声明（默认 lvgl.h 不导出，独立引用） */
 LV_FONT_DECLARE(lv_font_montserrat_12);
 #include "weather_icons.h"     // 单色天气图标（24x24 indexed-1bit）
-#include "brand_logo.h"        // 神舟传媒单色品牌标识（160x48 RGB565）
+#include "brand_logo.h"        // 单色品牌标识（160x48 RGB565）
 #include "french_quotes.h"     // 法语短句（内置 100 句，SD 词库兜底）
 #include "french_lib.h"        // 法语词库抽象：SD 优先 + 内置兜底
 #include <time.h>
