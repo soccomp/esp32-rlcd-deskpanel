@@ -1,0 +1,27 @@
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+.vscode/
+.pioide/
+
+# 编译产物
+*.o
+*.elf
+*.bin
+*.map
+*.a
+*.d
+*.checksum
+
+# 系统
+.DS_Store
+*.swp
+*~
+
+# 本地凭据（真实 WiFi 密码，不提交）
+src/wifi_config.h
+
+# Python
+__pycache__/
+*.pyc

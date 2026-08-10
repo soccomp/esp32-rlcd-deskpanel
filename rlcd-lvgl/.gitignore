@@ -1,0 +1,32 @@
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+.vscode/
+.pioide/
+
+# 编译产物
+*.o
+*.elf
+*.bin
+*.map
+*.a
+*.d
+*.checksum
+!src/**/*.bin
+
+# 系统
+.DS_Store
+*.swp
+*~
+
+# 本地凭据 / 配置（不提交，含真实 WiFi 密码与主机名）
+src/wifi_config.h
+src/local_config.h
+
+# 运行时数据（schedule.json 含个人会议隐私，绝不提交）
+schedule.json
+schedule.json.bak
+stocks_cache.json
+__pycache__/
+*.pyc

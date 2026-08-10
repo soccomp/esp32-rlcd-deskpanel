@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>首页设计 v3「晨间日报」· RLCD 400×300</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;padding:20px;background:#e7e5df;color:#111;font-family:"PingFang SC","Microsoft YaHei",sans-serif;display:grid;place-items:center;min-height:100vh}
+.wrap{display:flex;flex-direction:column;align-items:center;gap:12px}
+.note{width:400px;font-size:12px;line-height:1.65;color:#555}
+.note b{color:#333}
+.screen{width:400px;height:300px;background:#fdfdfb;border:1.5px solid #cfcec8;border-radius:6px;overflow:hidden;position:relative;color:#111}
+.sb{position:absolute;left:0;right:0;top:0;height:22px;border-bottom:1px solid #e5e4df;font-size:11px;color:#9a9a96}
+.sb .l{position:absolute;left:12px;top:4px;display:flex;align-items:center;gap:5px}
+.sb .r{position:absolute;right:12px;top:4px;display:flex;align-items:center;gap:6px}
+.clock{position:absolute;left:30px;top:34px;font-size:84px;font-weight:700;letter-spacing:-2px;line-height:1}
+.date{position:absolute;left:32px;top:118px;font-size:13px;color:#9a9a96}
+.cam{position:absolute;left:272px;top:34px;width:52px;height:52px;border:1.5px dashed #cfcec6;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11px;color:#b5b4ac;letter-spacing:1px}
+.camsub{position:absolute;left:272px;top:90px;width:52px;text-align:center;font-size:9px;color:#c5c4bc}
+.hr{position:absolute;left:30px;right:30px;top:166px;height:1px;background:#e0dfda}
+.wx{position:absolute;left:30px;top:196px;font-size:24px;font-weight:600;line-height:1;display:flex;align-items:center;gap:10px}
+.wx .t{font-size:17px;font-weight:400;color:#555}
+.wx2{position:absolute;left:30px;top:232px;font-size:24px;font-weight:600;line-height:1;display:flex;align-items:center;gap:10px}
+.wx2 .t{font-size:17px;font-weight:400;color:#555}
+.indoor{position:absolute;left:30px;top:278px;font-size:12px;color:#9a9a96}
+.market{position:absolute;left:252px;top:196px;font-size:11px;line-height:17px;color:#333}
+.market b{font-weight:600}
+.market .up{color:#111}
+.xsep{position:absolute;left:252px;right:30px;top:242px;border-top:1px dashed #ddd}
+.xuser{position:absolute;left:252px;top:250px;font-size:12px;color:#111;font-weight:600}
+.xuser .d{color:#9a9a96;font-weight:400;margin-left:5px}
+.xtxt{position:absolute;left:252px;top:268px;font-size:12px;color:#555;line-height:1.5;max-width:124px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="note"><b>设计语言「晨间日报」</b>：超大时钟作焦点 · 非对称留白 · 单一字体族（PingFang SC）· 仅 1 条分隔线 · 三级灰阶（黑/灰/浅灰）。全部去边框卡片，靠深浅分层而非框线。</div>
+  <div class="screen">
+    <div class="sb">
+      <span class="l"><svg width="13" height="12" viewBox="0 0 13 12"><path d="M1.5 8.5c2.7-3 7.3-3 10 0" fill="none" stroke="#9a9a96" stroke-width="1.4"/><path d="M3.8 5.9c1.6-1.9 3.8-1.9 5.4 0" fill="none" stroke="#9a9a96" stroke-width="1.4"/><circle cx="6.5" cy="10.3" r="1.2" fill="#9a9a96"/></svg>Office-M1</span>
+      <span class="r">08-04 星期二<svg width="17" height="10" viewBox="0 0 17 10"><rect x="0.5" y="0.5" width="13" height="9" rx="2" fill="none" stroke="#9a9a96" stroke-width="1.2"/><rect x="2" y="2" width="9" height="6" fill="#9a9a96"/><path d="M14.5 3v4a2 2 0 0 0 2-2 2 2 0 0 0-2-2z" fill="#9a9a96"/></svg></span>
+    </div>
+    <div class="clock">20:51</div>
+    <div class="date">2026年8月4日 星期二</div>
+    <div class="cam">CAM</div>
+    <div class="camsub">明日接入</div>
+    <div class="hr"></div>
+    <div class="wx">
+      <svg width="26" height="26" viewBox="0 0 26 26"><circle cx="13" cy="13" r="6" fill="none" stroke="#111" stroke-width="1.8"/><g stroke="#111" stroke-width="1.5"><path d="M13 1.5v3.5M13 21v3.5M1.5 13h3.5M21 13h3.5M4.6 4.6l2.5 2.5M18.9 18.9l2.5 2.5M21.4 4.6l-2.5 2.5M7.1 18.9l-2.5 2.5"/></g></svg>
+      <span>晴</span><span class="t">26~34°</span>
+    </div>
+    <div class="wx2">
+      <svg width="26" height="26" viewBox="0 0 26 26"><g fill="#fff" stroke="#111" stroke-width="1.4"><circle cx="9" cy="16" r="5"/><circle cx="14.5" cy="13.5" r="6"/><circle cx="19.5" cy="17" r="4"/></g></svg>
+      <span>阴</span><span class="t">26~37°</span>
+    </div>
+    <div class="indoor">室内 26.5° · 湿度 52%</div>
+    <div class="market">
+      <div><b>沪深300</b> 4128.36 <span class="up">▲0.82%</span></div>
+      <div><b>上证指数</b> 3658.68 <span class="up">▲0.57%</span></div>
+      <div><b>创业板指</b> 2350.74 <span class="up">▲1.21%</span></div>
+    </div>
+    <div class="xsep"></div>
+    <div class="xuser">@OpenAI<span class="d">08-03</span></div>
+    <div class="xtxt">Codex update brings new workflow improvements to all developers…</div>
+  </div>
+  <div class="note">相对 v2 的变化：① 去全部卡片边框与虚线网格，仅保留 1 条分隔线；② 时钟 62px→84px 成为绝对焦点；③ 指数去掉迷你折线压成 3 行小字；④ CAM 占位改圆环（呼应 CASC 圆环）放右上角；⑤ 单一字体族，三级灰阶分层。</div>
+</div>
+</body>
+</html>

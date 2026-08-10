@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>RLCD Page 2 · 环境与趣味页预览</title>
+<style>
+  :root{
+    --paper:#f3f0e7;      /* 反射屏：无背光，呈浅灰纸色 */
+    --ink:#161613;        /* 单色像素：暗 */
+    --ink-70:rgba(22,22,19,.70);
+    --ink-50:rgba(22,22,19,.50);
+    --ink-80:rgba(22,22,19,.80);
+    --screen-w:400px;
+    --screen-h:300px;
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0;background:#2b2b2b;color:#e8e8e8;
+    font-family:"PingFang SC","Microsoft YaHei",-apple-system,system-ui,sans-serif;
+    display:flex;flex-direction:column;align-items:center;gap:14px;padding:22px;
+  }
+  h1{font-size:15px;font-weight:600;margin:0;letter-spacing:.5px;color:#cfcabb;}
+  .sub{font-size:12px;color:#9a958a;margin-top:-8px;}
+  /* 状态栏 */
+  .statusbar{
+    position:absolute;top:0;left:0;width:var(--screen-w);height:18px;
+    display:flex;align-items:center;justify-content:space-between;
+    padding:0 8px;font-size:11px;color:var(--ink-70);
+  }
+  /* 屏幕 */
+  .screen{
+    position:relative;width:var(--screen-w);height:var(--screen-h);
+    background:var(--paper);border-radius:6px;overflow:hidden;
+    box-shadow:0 0 0 2px #111, 0 10px 30px rgba(0,0,0,.5);
+    color:var(--ink);
+  }
+  .screen *{color:var(--ink);}
+  .lbl{font-size:13px;}
+  .lbl70{font-size:13px;color:var(--ink-70);}
+  .lbl50{font-size:12px;color:var(--ink-50);}
+  .lbl80{font-size:12px;color:var(--ink-80);}
+  /* 木鱼 */
+  .fish{
+    position:absolute;left:50px;top:82px;width:96px;height:72px;
+    background:var(--ink);border-radius:34px;cursor:pointer;
+  }
+  .fish .mouth{
+    position:absolute;left:50%;top:16px;transform:translateX(-50%);
+    width:60px;height:7px;background:var(--paper);border-radius:3px;
+  }
+  .fish .knot{
+    position:absolute;right:8px;bottom:10px;width:12px;height:12px;
+    background:var(--paper);border-radius:50%;
+  }
+  .merit-lbl{position:absolute;left:78px;top:176px;font-size:15px;}
+  .merit-num{
+    position:absolute;left:90px;top:194px;font-size:46px;font-weight:700;
+    font-family:"Helvetica Neue",Arial,sans-serif;line-height:1;
+  }
+  .hint{position:absolute;left:34px;bottom:10px;font-size:12px;color:var(--ink-50);}
+  /* 卡片 */
+  .card{position:absolute;border:1px solid var(--ink);border-radius:3px;}
+  .env{left:202px;top:4px;width:192px;height:118px;padding:6px;}
+  .env .row{display:flex;flex-direction:column;gap:3px;margin-top:2px;}
+  .spark{display:flex;align-items:flex-end;gap:2px;height:42px;margin-top:4px;}
+  .spark i{display:block;width:4px;background:var(--ink);border-radius:1px;height:2px;transition:height .3s;}
+  /* 雷达 */
+  .radar{left:202px;top:128px;width:192px;height:148px;padding:4px;}
+  .scope{position:absolute;left:48px;top:20px;width:96px;height:96px;}
+  .scope .ring{
+    position:absolute;border:1px solid var(--ink);border-radius:50%;
+    left:50%;top:50%;transform:translate(-50%,-50%);
+  }
+  .scope .dot{position:absolute;left:50%;top:50%;width:6px;height:6px;background:var(--ink);
+    border-radius:50%;transform:translate(-50%,-50%);}
+  .scope .sweep{
+    position:absolute;left:50%;top:50%;width:2px;height:44px;
+    background:var(--ink);border-radius:2px;transform-origin:50% 100%;
+    animation:spin 2.2s linear infinite;
+  }
+  @keyframes spin{from{transform:translate(-50%,-100%) rotate(0deg);}
+    to{transform:translate(-50%,-100%) rotate(360deg);}}
+  .blip{position:absolute;width:6px;height:6px;background:var(--ink);border-radius:50%;
+    transform:translate(-50%,-50%);display:none;}
+  .rcount{position:absolute;left:4px;bottom:18px;font-size:12px;}
+  .rindex{position:absolute;left:4px;bottom:4px;font-size:12px;color:var(--ink-80);}
+  /* 浮动 +1 */
+  .plus1{
+    position:absolute;font-size:20px;font-weight:700;font-family:Arial,sans-serif;
+    pointer-events:none;animation:floatup .85s ease-out forwards;
+  }
+  @keyframes floatup{
+    from{transform:translateY(0);opacity:1;}
+    to{transform:translateY(-36px);opacity:0;}
+  }
+  /* 工具栏 */
+  .toolbar{display:flex;gap:8px;flex-wrap:wrap;justify-content:center;max-width:420px;}
+  button{
+    background:#3a3a3a;color:#eee;border:1px solid #555;border-radius:5px;
+    padding:6px 12px;font-size:13px;cursor:pointer;
+  }
+  button:hover{background:#474747;}
+  .note{font-size:11px;color:#888;max-width:420px;text-align:center;line-height:1.5;}
+</style>
+</head>
+<body>
+  <h1>ESP32-S3-RLCD · Page 2 环境与趣味页</h1>
+  <div class="sub">1:1 单色反射屏预览（浅底深字，无背光）—— 与 ui_ambient.cpp 布局一致</div>
+
+  <div class="screen">
+    <div class="statusbar">
+      <span>📶</span><span id="sb-clock">--:--&nbsp;&nbsp;----/--/--</span><span>🔋</span>
+    </div>
+
+    <!-- 左：电子木鱼 -->
+    <div class="lbl70" style="position:absolute;left:8px;top:20px;">电子木鱼</div>
+    <div class="fish" id="fish" title="点击 = 按 BOOT 键叩木鱼">
+      <div class="mouth"></div><div class="knot"></div>
+    </div>
+    <div class="merit-lbl">功德</div>
+    <div class="merit-num" id="merit">0</div>
+    <div class="hint">按 BOOT 键 积功德</div>
+
+    <!-- 右：环境监测 -->
+    <div class="card env">
+      <div class="lbl70">环境监测</div>
+      <div class="row">
+        <div class="lbl" id="e-temp">温度 --.-°C</div>
+        <div class="lbl" id="e-humi">湿度 --.-%</div>
+        <div class="lbl80" id="e-comfort">舒适度: —</div>
+      </div>
+      <div class="spark" id="spark"></div>
+      <div class="lbl50" id="e-trend">趋势: —</div>
+    </div>
+
+    <!-- 右：办公室热闹雷达 -->
+    <div class="card radar">
+      <div class="lbl70" style="position:absolute;left:4px;top:4px;">办公室热闹雷达</div>
+      <div class="scope">
+        <div class="ring" style="width:92px;height:92px;"></div>
+        <div class="ring" style="width:60px;height:60px;"></div>
+        <div class="ring" style="width:28px;height:28px;"></div>
+        <div class="dot"></div>
+        <div class="sweep"></div>
+        <!-- blips: 8 个预设偏移 -->
+        <div class="blip" style="left:calc(50% + 30px);top:calc(50% - 18px);"></div>
+        <div class="blip" style="left:calc(50% - 26px);top:calc(50% - 26px);"></div>
+        <div class="blip" style="left:calc(50% + 12px);top:calc(50% + 30px);"></div>
+        <div class="blip" style="left:calc(50% - 30px);top:calc(50% + 14px);"></div>
+        <div class="blip" style="left:calc(50% + 34px);top:calc(50% + 18px);"></div>
+        <div class="blip" style="left:calc(50% - 10px);top:calc(50% - 34px);"></div>
+        <div class="blip" style="left:calc(50% + 22px);top:calc(50% - 32px);"></div>
+        <div class="blip" style="left:calc(50% - 34px);top:calc(50% - 4px);"></div>
+      </div>
+      <div class="rcount" id="r-count">周围设备: -- 台</div>
+      <div class="rindex" id="r-index">摸鱼指数: --</div>
+    </div>
+  </div>
+
+  <div class="toolbar">
+    <button onclick="tap()">叩木鱼 (+1)</button>
+    <button onclick="simEnv()">模拟环境刷新</button>
+    <button onclick="simScan()">模拟雷达扫描</button>
+    <button onclick="simMeeting()">模拟会议 10 分钟提醒</button>
+  </div>
+  <div class="note">
+    点击木鱼或「叩木鱼」累计功德并弹出 +1 浮动动画（板上对应播放木鱼 PCM 音效）。<br>
+    「摸鱼指数」由扫描到的设备数估算：≥12 高 / ≥5 中 / &lt;5 低。板上由 Wi-Fi + BLE 扫描统计。
+  </div>
+
+<script>
+  let merit = 0;
+  const blips = [...document.querySelectorAll('.blip')];
+  // 迷你趋势柱状缓冲
+  const hist = [];
+  const sparkEl = document.getElementById('spark');
+  for (let i=0;i<12;i++){ const b=document.createElement('i'); sparkEl.appendChild(b); }
+
+  function tap(){
+    merit++;
+    document.getElementById('merit').textContent = merit;
+    const fish = document.getElementById('fish');
+    const r = fish.getBoundingClientRect();
+    const s = document.querySelector('.screen').getBoundingClientRect();
+    const p = document.createElement('div');
+    p.className='plus1'; p.textContent='+1';
+    p.style.left = (r.left - s.left + r.width/2 - 8) + 'px';
+    p.style.top  = (r.top  - s.top  + r.height/2 - 10) + 'px';
+    document.querySelector('.screen').appendChild(p);
+    setTimeout(()=>p.remove(), 870);
+  }
+  document.getElementById('fish').addEventListener('click', tap);
+
+  function comfortEval(t,h){
+    let hot=t>26, cold=t<20, wet=h>60, dry=h<40;
+    if(!hot&&!cold&&!wet&&!dry) return '舒适';
+    let s='';
+    if(hot)s+='偏热'; if(cold)s+='偏冷'; if(wet)s+='偏湿'; if(dry)s+='偏干';
+    return s||'—';
+  }
+  function simEnv(){
+    const t = 18 + Math.random()*12;       // 18~30
+    const h = 35 + Math.random()*35;        // 35~70
+    document.getElementById('e-temp').textContent = '温度 '+t.toFixed(1)+'°C';
+    document.getElementById('e-humi').textContent = '湿度 '+h.toFixed(1)+'%';
+    document.getElementById('e-comfort').textContent = '舒适度: '+comfortEval(t,h);
+    hist.push(t); if(hist.length>12) hist.shift();
+    const avg = hist.reduce((a,b)=>a+b,0)/hist.length;
+    const tr = t>avg+0.3?'上升':(t<avg-0.3?'下降':'平稳');
+    document.getElementById('e-trend').textContent = '趋势: '+tr;
+    const bars=[...sparkEl.children];
+    bars.forEach((b,i)=>{
+      const v = hist[i]!==undefined?hist[i]:18;
+      let hh = (v-10)/(35-10)*38; hh=Math.max(2,Math.min(40,hh));
+      b.style.height = hh+'px';
+    });
+  }
+
+  function simScan(){
+    const n = Math.floor(Math.random()*16);   // 0~15
+    const show = Math.min(n,8);
+    blips.forEach((b,i)=> b.style.display = i<show?'block':'none');
+    const idx = n>=12?'高':(n>=5?'中':'低');
+    document.getElementById('r-count').textContent = '周围设备: '+n+' 台';
+    document.getElementById('r-index').textContent = '摸鱼指数: '+idx;
+  }
+
+  function simMeeting(){
+    document.getElementById('r-count').textContent = '周围设备: (滴滴) 会议 10 分钟后开始';
+  }
+
+  // 初始化：给一个示例环境读数
+  simEnv(); simScan();
+</script>
+</body>
+</html>
