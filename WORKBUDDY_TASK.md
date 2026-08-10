@@ -6,7 +6,7 @@
 ## Task
 
 - **Task ID:** RLCD-001
-- **Status:** OPEN
+- **Status:** DONE (executed by WorkBuddy on M1; pending ChatGPT review of pushed commit)
 - **Branch:** `workbuddy-development`
 - **Scope:** Collaboration environment preflight only
 - **Priority:** P0 — establish a reliable M1 ↔ GitHub development loop before changing application code
@@ -95,19 +95,19 @@ When the preflight is complete, edit **this same file** and replace the executio
 
 ### Execution report
 
-- **M1 project path:** TBD
-- **Remote:** TBD
-- **Working branch:** TBD
-- **Local HEAD:** TBD
-- **origin/workbuddy-development HEAD:** TBD
-- **origin/main HEAD:** TBD
-- **Working tree before task:** TBD
-- **Local-only/uncommitted work found:** TBD
-- **Local ↔ GitHub synchronized:** TBD
-- **RLCD build:** TBD
-- **ESP32-CAM build:** TBD
-- **Hardware/USB toolchain check:** TBD
-- **Problems/blockers:** TBD
+- **M1 project path:** `/Users/m1work/Projects/ESP32S3-RLCD/github-export/esp32-rlcd-deskpanel` (active checkout mirroring GitHub)
+- **Remote:** `origin → https://github.com/soccomp/esp32-rlcd-deskpanel.git`
+- **Working branch:** `workbuddy-development` (tracks `origin/workbuddy-development`)
+- **Local HEAD:** `d07f3e3` (chore: add WorkBuddy task workflow)
+- **origin/workbuddy-development HEAD:** `d07f3e3`
+- **origin/main HEAD:** `d7d4fbc`
+- **Working tree before task:** clean (`## workbuddy-development...origin/workbuddy-development`, no changes)
+- **Local-only/uncommitted work found:** none (no uncommitted, untracked, or stashed changes)
+- **Local ↔ GitHub synchronized:** yes — local HEAD == origin/workbuddy-development == d07f3e3; workbuddy-development is one commit ahead of main
+- **RLCD build:** **PASS** — env `esp32-s3-rlcd` (custom board, Arduino + LVGL 8.4.0); RAM 42.6% (139732 B) / Flash 64.3% (2149409 B). ⚠️ Found & fixed a build-breaking issue in `rlcd-lvgl/src/schedule_data.h`: the sanitized placeholder JSON was embedded as a C string literal **without escaping its inner double quotes** → `error: unable to find string literal operator 'operator""update_time'`. Regenerated the header with escaped quotes (`\"`); build then PASSED. This is the only source change made during this preflight (documented per "existing project cannot build" clause).
+- **ESP32-CAM build:** **PASS** — env `esp32cam` (esp32-cam library, huge_app.csv partition); RAM 16.3% (53500 B) / Flash 30.5% (959157 B)
+- **Hardware/USB toolchain check:** `/dev/cu.usbserial-1120` present (CH340 USB-TTL, ESP32-CAM serial link, online since 09:14). RLCD not currently connected via USB-CDC (no /dev/cu.usbmodem*); no flashing performed per task scope.
+- **Problems/blockers:** none blocking. One build defect discovered and fixed (see RLCD build above). Both projects compile cleanly; no warnings materially relevant.
 
 ## Git checkpoint
 
