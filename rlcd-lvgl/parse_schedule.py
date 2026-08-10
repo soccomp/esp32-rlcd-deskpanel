@@ -11,11 +11,11 @@ parse_schedule.py — 神舟传媒一周会议日程表 解析 & API 服务
 用法：
   python parse_schedule.py              # 启动 API 服务（默认 http://0.0.0.0:8100）
   python parse_schedule.py --dump       # 仅输出 JSON 到 stdout，不启动服务
-  python parse_schedule.py --name 张三   # 用其他名字检测个人会议（默认：宋明宇）
+  python parse_schedule.py --name 张三   # 用其他名字检测个人会议（默认：你的姓名）
 
 ESP32 端调用示例：
   GET http://<你的IP>:8100/api/schedule
-  GET http://<你的IP>:8100/api/schedule?name=宋明宇&mine_only=true   # 只返回我的会议
+  GET http://<你的IP>:8100/api/schedule?name=张三&mine_only=true   # 只返回我的会议
 """
 
 import json
@@ -897,7 +897,7 @@ def load_source_from_file(filepath: str = None) -> str:
     return "神舟传媒一周主要会议日程表"
 
 
-def build_schedule_json(target_name: str = "宋明宇", city: str = None) -> dict:
+def build_schedule_json(target_name: str = "你的姓名", city: str = None) -> dict:
     """构建完整的 schedule.json 结构。city 非空时附带 weather 字段（失败为 None）。"""
     meetings = enrich_meetings(load_meetings_from_file(), target_name)
 
@@ -923,7 +923,7 @@ def build_schedule_json(target_name: str = "宋明宇", city: str = None) -> dic
     return result
 
 
-def save_schedule_json(filepath: str, target_name: str = "宋明宇") -> str:
+def save_schedule_json(filepath: str, target_name: str = "你的姓名") -> str:
     """保存 JSON 到文件，返回实际写入路径"""
     data = build_schedule_json(target_name)
     p = Path(filepath)
@@ -979,7 +979,7 @@ def extract_from_image(image_path: str) -> list:
 #  FastAPI HTTP 服务
 # ============================================================
 
-def create_app(target_name: str = "宋明宇", city: str = "北京"):
+def create_app(target_name: str = "你的姓名", city: str = "北京"):
     """创建 FastAPI 应用实例"""
     from fastapi import FastAPI, Query
     from fastapi.responses import JSONResponse
@@ -1166,8 +1166,8 @@ def main():
         help="输出 JSON 文件路径（默认: ./schedule.json）",
     )
     parser.add_argument(
-        "--name", default="宋明宇",
-        help="用于检测个人会议的名字（默认: 宋明宇）",
+        "--name", default="你的姓名",
+        help="用于检测个人会议的名字（默认: 你的姓名）",
     )
     parser.add_argument(
         "--city", default="北京",
