@@ -21,6 +21,7 @@
 #include "SD_MMC.h"
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
+#include <freertos/semphr.h>   /* g_frame_mutex：latest 发布与快照的互斥 */
 
 /* ================== 摄像头引脚（CAMERA_MODEL_AI_THINKER） ================== */
 #define PWDN_GPIO_NUM   32
@@ -144,14 +145,40 @@ static void setup_camera(void)
  * 原因2：按需 fb_get 会阻塞（等新帧），HTTP handler 卡死。
  * 架构：后台常驻抓帧 -> /capture 秒回缓存帧，与 RLCD 的"拉最新帧"模式天然匹配。
  * fb_get/fb_return 不涉及 JPEG 解码（传感器硬件编码），CPU 开销极低。 */
-/* ★ 双缓冲 JPEG：grab 写 buf[1-idx]，HTTP 发 buf[idx]——消除 send_P 与 memcpy 的
- * 无锁竞态（VGA 大帧 + 高频拉流下旧版单缓冲会卡死 WebServer，即"半死"症状）。 */
+/* ★ 帧快照协议（RLCD-002 Issue A 修复）：
+ *  - g_last_jpeg[2] 双缓冲由 grab 任务持有并发布（锁内 memcpy + 更新 len/idx/seq）；
+ *  - HTTP 服务侧不再直接读 g_last_jpeg[idx]/g_last_len（会与发布产生
+ *    元数据错配，且慢速网络发送期间缓冲会被抓帧覆盖→花屏/损坏帧）；
+ *  - 改为 snapshot_latest()：锁内把当前完整帧 memcpy 到 g_send_jpeg（staging），
+ *    带出 g_send_len/g_send_seq，解锁后再 client.write()——发送期间字节不可变，
+ *    len/seq/buffer 永远同属一帧。单线程 HTTP 服务串行处理连接，单块 staging 足够。 */
 static uint8_t       *g_last_jpeg[2] = { nullptr, nullptr };
+static uint8_t       *g_send_jpeg    = nullptr;   /* staging/发送缓冲（PSRAM） */
 static volatile size_t g_last_len = 0;
+static volatile size_t g_send_len = 0;            /* staging 帧长度（同帧快照） */
 static volatile uint8_t  g_jpeg_idx = 0;    /* 原子交换：读侧取 idx，写侧取 1-idx */
 static volatile uint32_t g_last_seq = 0;    /* 递增帧号：>0 即证明有帧流 */
+static volatile uint32_t g_send_seq = 0;    /* staging 帧号（同帧快照） */
+static SemaphoreHandle_t g_frame_mutex = NULL;  /* 保护发布与快照的短临界区 */
 static volatile uint32_t g_last_handle_ms = 0;  /* loop 里 handleClient 心跳 */
 static volatile uint32_t g_last_serve_ms  = 0;  /* 最近一次成功响应（/capture 或 /status） */
+
+/* 快照当前最新帧到 staging 缓冲（锁内 memcpy，短临界区；解锁后由调用方发送）。
+ * 返回 true 且有数据时，g_send_len/g_send_seq 与 g_send_jpeg 同帧一致。 */
+static bool snapshot_latest(void)
+{
+    if (!g_send_jpeg || !g_frame_mutex) return false;
+    xSemaphoreTake(g_frame_mutex, portMAX_DELAY);
+    bool ok = false;
+    if (g_last_len > 0 && g_last_jpeg[g_jpeg_idx]) {
+        memcpy(g_send_jpeg, g_last_jpeg[g_jpeg_idx], g_last_len);
+        g_send_len = g_last_len;
+        g_send_seq = g_last_seq;
+        ok = true;
+    }
+    xSemaphoreGive(g_frame_mutex);
+    return ok;
+}
 
 static void cam_grab_task(void *arg)
 {
@@ -159,12 +186,17 @@ static void cam_grab_task(void *arg)
     for (;;) {
         camera_fb_t *fb = esp_camera_fb_get();
         if (fb) {
-            uint8_t w = 1 - g_jpeg_idx;
-            if (fb->len <= JPEG_BUF && g_last_jpeg[w]) {
-                memcpy(g_last_jpeg[w], fb->buf, fb->len);
-                g_last_len = fb->len;
-                g_jpeg_idx = w;      /* 写完原子交换，读侧可见 */
-                g_last_seq++;
+            if (fb->len <= JPEG_BUF) {
+                /* 发布在锁内：len/idx/seq 与 buffer 原子一致，reader 快照不会错配 */
+                xSemaphoreTake(g_frame_mutex, portMAX_DELAY);
+                uint8_t w = 1 - g_jpeg_idx;
+                if (g_last_jpeg[w]) {
+                    memcpy(g_last_jpeg[w], fb->buf, fb->len);
+                    g_last_len = fb->len;
+                    g_jpeg_idx = w;      /* 写完原子交换，读侧可见 */
+                    g_last_seq++;
+                }
+                xSemaphoreGive(g_frame_mutex);
             }
             esp_camera_fb_return(fb);
         }
@@ -297,18 +329,19 @@ static void drain_headers(WiFiClient &client)
 
 static void handle_capture(WiFiClient &client)
 {
-    uint8_t idx = g_jpeg_idx;   /* 读侧：取当前完整帧，与 grab 写侧无竞态 */
-    if (g_last_len == 0 || !g_last_jpeg[idx]) {
+    /* 快照到 staging（锁内 memcpy），解锁后发送：发送期间字节不可变、len 同帧 */
+    if (!snapshot_latest() || g_send_len == 0) {
+        /* 即连即断：不要声称 keep-alive（本服务器单请求即断） */
         client.print("HTTP/1.1 503 Service Unavailable\r\n"
-                     "Content-Length: 8\r\nConnection: keep-alive\r\n\r\nno frame");
+                     "Content-Length: 8\r\nConnection: close\r\n\r\nno frame");
         return;
     }
     client.print("HTTP/1.1 200 OK\r\n");
     client.print("Content-Type: image/jpeg\r\n");
     client.print("Content-Length: ");
-    client.print(g_last_len);
+    client.print((unsigned long)g_send_len);
     client.print("\r\nConnection: close\r\n\r\n");
-    client.write(g_last_jpeg[idx], g_last_len);
+    client.write(g_send_jpeg, g_send_len);
     client.flush();
     g_frames++;
     g_last_serve_ms = millis();
@@ -372,14 +405,13 @@ static void handle_stream(WiFiClient &client)
      * 导致流立即退出 + stop() 发 RST。循环退出只靠 write 探测 + 超时兜底。 */
     for (;;) {
         uint32_t seq = g_last_seq;
-        if (seq != last_seq && g_last_len > 0) {
-            uint8_t idx = g_jpeg_idx;
+        if (seq != last_seq && snapshot_latest() && g_send_len > 0) {
             client.printf("--camframe\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
-                          (unsigned)g_last_len);
-            size_t n = client.write(g_last_jpeg[idx], g_last_len);
+                          (unsigned)g_send_len);
+            size_t n = client.write(g_send_jpeg, g_send_len);
             client.print("\r\n");
             if (n > 0) last_tx_ok = millis();
-            last_seq = seq;
+            last_seq = g_send_seq;   /* 已发送的 staging 帧号（与字节同帧） */
             g_last_serve_ms = millis();
         }
         g_last_handle_ms = millis();
@@ -516,12 +548,15 @@ void setup(void)
     setup_camera();
     setup_sdcard();
 
-    /* 帧缓存缓冲（PSRAM 双缓冲） + 抓帧任务 + 看门狗任务 */
+    /* 帧缓存缓冲（PSRAM 双缓冲 + staging 发送缓冲） + 抓帧任务 + 看门狗任务 */
+    g_frame_mutex = xSemaphoreCreateMutex();
     g_last_jpeg[0] = static_cast<uint8_t *>(heap_caps_malloc(JPEG_BUF, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     g_last_jpeg[1] = static_cast<uint8_t *>(heap_caps_malloc(JPEG_BUF, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    if (g_last_jpeg[0] && g_last_jpeg[1]) {
+    g_send_jpeg    = static_cast<uint8_t *>(heap_caps_malloc(JPEG_BUF, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (g_last_jpeg[0] && g_last_jpeg[1] && g_send_jpeg) {
         memset(g_last_jpeg[0], 0, JPEG_BUF);
         memset(g_last_jpeg[1], 0, JPEG_BUF);
+        memset(g_send_jpeg, 0, JPEG_BUF);
         xTaskCreatePinnedToCore(cam_grab_task, "camgrab", 2048, nullptr, 2, nullptr, 0);
         xTaskCreate(watchdog_task, "camwdt", 2048, nullptr, 5, nullptr);  /* 最高优先：不被饿死 */
         /* ⚠️ 串口直传任务已禁用（8-07 16:30）：1M 满载 UART 发送 + Serial.flush()

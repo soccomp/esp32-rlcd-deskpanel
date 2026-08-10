@@ -180,9 +180,13 @@ def _jpeg_valid(data: bytes) -> bool:
 def _cam_grabber_loop():
     """后台线程：连接摄像头 /stream MJPEG 流持续收帧，缓存最新完整 JPEG。
     视频流架构——一条连接持续推帧，零请求开销、零时序竞争；
-    连接断开自动重建。失败保留最后一帧并快速重试。"""
+    连接断开自动重建。失败保留最后一帧并快速重试。
+    RLCD-002 Issue B 修复：接收缓冲改为「连接局部」buf（bytearray），
+    每个新连接从空缓冲开始——旧连接残留字节绝不会污染新流；
+    同时校验 /stream 响应为 200 才解析 multipart。"""
     global _cam_frame, _cam_frame_seq, _cam_last_ok
     sock = None
+    buf = None          # 连接局部接收缓冲（bytearray）；重连后重建为空
     fail_streak = 0
     while True:
         try:
@@ -196,16 +200,21 @@ def _cam_grabber_loop():
                     "Connection: close\r\n\r\n"
                 )
                 sock.sendall(req.encode())
-                # 跳过 HTTP 响应头（到空行）
-                header = b""
-                while b"\r\n\r\n" not in header:
-                    chunk = sock.recv(4096)
-                    if not chunk:
-                        raise ConnectionError("stream closed in header")
-                    header += chunk
+                # 新连接：全新空接收缓冲
+                buf = bytearray()
+                # 校验状态行确实是 200，否则不把非 MJPEG 响应当流解析
+                status_line = _recv_line(sock, buf)
+                parts = status_line.split()
+                if len(parts) < 2 or parts[1] != b"200":
+                    raise ConnectionError(f"stream bad status: {status_line[:60]!r}")
+                # 跳过其余响应头（与 body 共用同一 buf，不丢字节）
+                while True:
+                    line = _recv_line(sock, buf)
+                    if line in (b"\r\n", b""):
+                        break
                 fail_streak = 0
             # 从 multipart 流读一帧
-            data = _cam_read_multipart(sock)
+            data = _cam_read_multipart(sock, buf)
             if _jpeg_valid(data):
                 with _cam_lock:
                     _cam_frame = data
@@ -222,18 +231,19 @@ def _cam_grabber_loop():
                 except Exception:
                     pass
                 sock = None
-            _recv_buf = b""            # 清理缓冲区：流断开后剩余字节在新流上无效
+            buf = None            # 丢弃死连接的解析状态（新连接重建空 buf）
             # 失败退避：短暂重试，不长时间阻塞
             time.sleep(0.5 if fail_streak < 10 else 2.0)
 
 
-def _cam_read_multipart(sock) -> bytes:
+def _cam_read_multipart(sock, buf) -> bytes:
     """从 MJPEG 流读取一帧完整 JPEG（boundary --camframe）。
     流格式：--camframe\\r\\n 头字段\\r\\n\\r\\n JPEG数据 \\r\\n
-    容忍 boundary 前的空白行（上一帧尾部 \\r\\n）。"""
+    容忍 boundary 前的空白行（上一帧尾部 \\r\\n）。
+    buf: 连接局部 bytearray 接收缓冲（与 _recv_line 共享）。"""
     # 跳过空白行，直到 boundary
     while True:
-        line = _recv_line(sock)
+        line = _recv_line(sock, buf)
         if line.startswith(b"--camframe"):
             break
         if line not in (b"\r\n", b""):
@@ -241,7 +251,7 @@ def _cam_read_multipart(sock) -> bytes:
     # 读帧头字段（Content-Length）
     clen = None
     while True:
-        line = _recv_line(sock)
+        line = _recv_line(sock, buf)
         if line in (b"\r\n", b""):
             break
         low = line.lower()
@@ -259,22 +269,20 @@ def _cam_read_multipart(sock) -> bytes:
     return body[:clen]
 
 
-_recv_buf = b""
-
-
-def _recv_line(sock, maxlen=4096) -> bytes:
-    """读一行（到 \n），缓冲式读取（避免 recv(1) 逐字节慢吞），带长度保护。
-    复用全局缓冲剩余字节，避免跨行数据丢失。"""
-    global _recv_buf
-    while b"\n" not in _recv_buf:
+def _recv_line(sock, buf, maxlen=4096) -> bytes:
+    """读一行（到 \\n），缓冲式读取（避免 recv(1) 逐字节慢吞），带长度保护。
+    buf: 连接局部 bytearray（就地累积/消费），调用方持有——不再使用模块全局，
+    从根本上杜绝跨连接的状态污染。"""
+    while b"\n" not in buf:
         chunk = sock.recv(8192)
         if not chunk:
             raise ConnectionError("stream closed in line")
-        _recv_buf += chunk
-        if len(_recv_buf) > 65536:
+        buf += chunk
+        if len(buf) > 65536:
             raise ValueError("recv buffer overflow")
-    idx = _recv_buf.index(b"\n") + 1
-    line, _recv_buf = _recv_buf[:idx], _recv_buf[idx:]
+    idx = buf.index(b"\n") + 1
+    line = bytes(buf[:idx])
+    del buf[:idx]
     if len(line) > maxlen:
         raise ValueError("line too long")
     return line

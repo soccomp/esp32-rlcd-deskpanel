@@ -6,7 +6,7 @@
 ## Task
 
 - **Task ID:** RLCD-002
-- **Status:** OPEN
+- **Status:** DONE (executed by WorkBuddy on M1; pending ChatGPT review)
 - **Branch:** `workbuddy-development`
 - **Priority:** P0
 - **Scope:** Camera transport integrity and reconnect reliability only
@@ -202,25 +202,25 @@ Replace the TBD fields below with real results before committing.
 
 ### Execution report
 
-- **Status:** TBD
-- **Starting HEAD:** TBD
-- **Files changed:** TBD
-- **Issue A confirmed root cause:** TBD
-- **Issue A fix:** TBD
-- **Issue B confirmed root cause:** TBD
-- **Issue B fix:** TBD
-- **ESP32-CAM build:** TBD
-- **RLCD build regression check:** TBD
-- **Python check:** TBD
-- **ESP32-CAM flashed:** TBD
-- **Healthy stream test:** TBD
-- **`/api/camframe` repeated-frame test:** TBD
-- **Forced reconnect test:** TBD
-- **Post-reconnect frame advancement:** TBD
-- **Serial/backend log result:** TBD
-- **Regression checks:** TBD
-- **New findings:** TBD
-- **Blockers / not tested:** TBD
+- **Status:** DONE (executed by WorkBuddy on M1; pending ChatGPT review)
+- **Starting HEAD:** `6a9eecf`
+- **Files changed:** `esp32-cam-fw/src/main.cpp` (Issue A), `rlcd-lvgl/parse_schedule.py` (Issue B), this file
+- **Issue A confirmed root cause:** confirmed. Grab task wrote the non-current buffer then updated shared `g_last_len` + `g_jpeg_idx` with **no lock**; HTTP handlers snapshotted `idx` and later read the *shared* `g_last_len`, so a reader could pair buffer A with length B (metadata mismatch). Worse, during a slow `client.write()` the grabber could publish the other buffer, swap `idx`, and on the next frame **reuse the buffer currently being sent** → bytes mutated mid-send (torn/corrupt JPEG).
+- **Issue A fix:** three-buffer snapshot protocol with a short critical section: (1) grabber publishes under `g_frame_mutex` (memcpy + len/idx/seq updated atomically); (2) new `snapshot_latest()` copies the current frame into a dedicated `g_send_jpeg` staging buffer under the same mutex, exporting `g_send_len`/`g_send_seq`; (3) HTTP handlers release the lock *before* any network write and serve the immutable staging snapshot (`/capture` and `/stream` both). Single-threaded HTTP loop means one staging buffer is sufficient. Also fixed the no-frame `503` to advertise `Connection: close` (server is connect-and-close), matching actual behavior. `g_frame_mutex` (FreeRTOS) + third PSRAM buffer allocated in `setup()`.
+- **Issue B confirmed root cause:** confirmed. `_recv_buf` is a module-global; `_cam_grabber_loop`'s `_recv_buf = b""` on the error path has **no `global` declaration** (function-local assignment), so the real global buffer retained bytes from the dead connection across reconnects → contaminated next multipart stream. Additionally, the initial `/stream` response was parsed into a *local* `header` variable (swallowing any bytes received past the header end, i.e. the first boundary), and the status line was **never checked for 200**.
+- **Issue B fix:** receive-buffer state is now connection-local: `_cam_grabber_loop` creates a fresh `bytearray()` per new socket, and `_recv_line(sock, buf)` / `_cam_read_multipart(sock, buf)` operate on it (in-place consume). On error the local `buf` is dropped, so a reconnect starts from an empty buffer. The `/stream` response status line is validated (`200`) before multipart parsing, and headers + body now share the same buffer (no byte loss). Module-global `_recv_buf` removed.
+- **ESP32-CAM build:** PASS — env `esp32cam`; RAM 16.3% (53500 B) / Flash 30.5% (959157 B); no relevant warnings
+- **RLCD build regression check:** PASS — env `esp32-s3-rlcd`; RAM 42.6% (139732 B) / Flash 64.2% (2144177 B); RLCD C++ untouched this round
+- **Python check:** PASS — `py_compile` + `import parse_schedule` OK; `_recv_buf` global confirmed removed
+- **ESP32-CAM flashed:** YES — with user's help holding IO0 (boot mode 0xa otherwise); 966064 bytes written, hash verified
+- **Healthy stream test:** PASS — backend received valid 640×480 baseline JPEGs; `/api/camframe` returned 200 + valid JPEG on 5 consecutive requests
+- **`/api/camframe` repeated-frame test:** PASS — repeated 200 responses; md5 kept changing across samples (frames advancing, not a stale single frame)
+- **Forced reconnect test:** PASS — triggered ESP32-CAM reset via serial (power-cycle equivalent); backend kept serving last-good frame during the outage, then **automatically reconnected and resumed** receiving frames without a backend restart
+- **Post-reconnect frame advancement:** PASS — md5 sequence `3fc143d7 → 85ca9a97 → a801f579` with sizes 15797 → 32500 → 49951 bytes after reconnect
+- **Serial/backend log result:** no crashes, watchdog loops, corrupt-frame errors, or resource exhaustion observed in serial/backend logs
+- **Regression checks:** `/status` OK (when reachable), `/capture` OK (200 + valid JPEG), `/stream` functional (backend keeps pulling it), `/api/schedule` `/api/stocks` `/api/weather_qh` all 200 and unchanged; no image-quality parameters altered
+- **New findings:** (1) `/api/health` returns 404 though startup banner advertises it — pre-existing, out of scope, not fixed. (2) Under the office AP (BTWIFI6) the ESP32-CAM's own WiFi link is unstable (direct `/status` short connections intermittently fail; frames advance but slowly) — pre-existing environment issue, not introduced by this change.
+- **Blockers / not tested:** none blocking. Full sustained high-frame-rate observation is limited by the BTWIFI6 environment's weak ESP32-CAM link (hardware/network condition), not by the transport fixes.
 
 ## Git checkpoint
 
