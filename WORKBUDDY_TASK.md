@@ -5,243 +5,335 @@
 
 ## Task
 
-- **Task ID:** RLCD-002
-- **Status:** DONE (executed by WorkBuddy on M1; pending ChatGPT review)
+- **Task ID:** RLCD-003
+- **Status:** OPEN
 - **Branch:** `workbuddy-development`
 - **Priority:** P0
-- **Scope:** Camera transport integrity and reconnect reliability only
-- **Baseline:** `6ec8740d90de666cfd0cbe047edb6baa4e209ce5`
-- **Previous task:** RLCD-001 accepted by ChatGPT review
+- **Scope:** RLCD live-frame freshness + 1-bit camera rendering correctness
+- **Baseline:** `34675ae31eeb3a2bab38345fbdcbb547d6880f5b`
+- **Previous task:** RLCD-002 accepted for its transport/reconnect scope
 
-## Context / review result
+## Owner-observed symptom after RLCD-002
 
-RLCD-001 is accepted.
+On the real RLCD screen:
 
-The collaboration loop is now verified on the M1:
-- local checkout tracks `origin/workbuddy-development`;
-- no local-only work was found;
-- RLCD PlatformIO build passes;
-- ESP32-CAM PlatformIO build passes;
-- the build-breaking escaped-JSON defect in `rlcd-lvgl/src/schedule_data.h` was correctly documented and fixed because the preflight could not otherwise complete.
+1. Camera view still **freezes on one frame and does not visibly advance**.
+2. Image still looks like a **gray dotted/dither matrix** and is basically unrecognizable.
+3. Therefore RLCD-002 fixed upstream transport integrity, but the user-visible camera feature is still not acceptable.
 
-Do not revisit RLCD-001 unless this task exposes a regression.
+Treat the physical RLCD result as authoritative. Do not declare success merely because the Mac backend or `/api/camframe` is advancing.
+
+## Review conclusion from ChatGPT
+
+RLCD-002 itself is accepted for its stated scope:
+- ESP32-CAM → Mac backend frames were proven to advance;
+- `/api/camframe` returned changing JPEGs;
+- forced ESP32-CAM reset recovered without restarting the backend.
+
+The remaining problem is now concentrated in the **Mac → RLCD fetch/decode/publish/UI path** plus the **1-bit image-processing pipeline**.
+
+ChatGPT confirmed several concrete defects in current RLCD code:
+
+### Defect A — stale frame is treated as fresh forever
+
+`cam_client.cpp` sets `g_new_frame = true` after the first successful frame, but `cam_client_get_frame()` never clears or otherwise ages that state.
+
+Current behavior effectively becomes:
+- first frame succeeds;
+- `g_new_frame` stays true forever;
+- `cam_client_get_frame()` keeps returning the last buffer even when no later frame arrives;
+- UI resets its failure counter on every timer tick because `cam_client_get_frame()` returns true;
+- screen can freeze forever on one stale frame while status still claims camera is online.
+
+This matches the owner-observed symptom and must be fixed.
+
+### Defect B — self-heal reboot branch is unreachable
+
+Current logic checks:
+
+```cpp
+if (fail_total >= 24) {
+    ...
+    fail_total = 0;
+} else if (fail_total >= 48) {
+    esp_restart();
+}
+```
+
+The `>=48` branch can never execute because `>=24` wins first and resets the count.
+
+Fix with explicit recovery stages or equivalent logic. Do not simply reorder conditions while still resetting the counter in a way that prevents second-stage recovery.
+
+Also inspect whether `WiFi.disconnect(true)` followed by `WiFi.reconnect()` is correct for the Arduino-ESP32 version in this project; do not accidentally turn WiFi off and then attempt a reconnect with the radio disabled.
+
+### Defect C — Bayer comparison is mathematically wrong
+
+Current code computes luminance in `0..255`, then computes Bayer threshold as approximately `-128..124`:
+
+```cpp
+int16_t thr = (bayer * 4) - 128;
+set_bit(..., lum < thr);
+```
+
+Those values are not in the same domain. For negative thresholds, a `0..255` luminance can never be below the threshold, so a large portion of matrix positions can never become black.
+
+A standard 8x8 Bayer threshold for direct comparison with `0..255` luminance should also be mapped into approximately `0..255` (for example an integer midpoint mapping such as `bayer * 4 + 2`, or an equivalent mathematically correct formulation).
+
+Do not keep the current `-128` direct-comparison formula.
+
+### Defect D — dithering happens before thumbnail scaling
+
+The current pipeline converts the camera frame to 1-bit Bayer pixels inside the JPEG decoder callback, then `ui_camera.cpp` downsizes that already-dithered 1-bit image with nearest-neighbor scaling.
+
+That destroys the spatial pattern used to represent gray detail and can turn a recognizable source into meaningless dot noise.
+
+**Dithering must be the last spatial image-processing step.**
+
+For any thumbnail or reduced-size camera view, resize grayscale/intensity data first, then convert to 1-bit at the final display dimensions.
+
+---
 
 ## Goal
 
-Fix the two highest-risk defects in the camera transport path before any image-quality tuning:
+Make the real RLCD camera view satisfy both conditions:
 
-1. **ESP32-CAM latest-JPEG publication / serving must be frame-consistent and race-safe.**
-2. **Mac backend MJPEG reconnect must start with clean parser state and recover reliably after a stream break.**
+1. **LIVE:** visible motion continues over time instead of freezing on one stale frame.
+2. **RECOGNIZABLE:** the 1-bit image is materially easier to recognize and no longer dominated by an incorrect gray-dot matrix.
 
-This task is about transport correctness and reconnect stability. Do **not** tune Bayer dithering, contrast, crop, thumbnail scaling, UI layout, or RLCD online/offline presentation in this round.
-
-## Files in scope
-
-Primary files:
-- `esp32-cam-fw/src/main.cpp`
-- `rlcd-lvgl/parse_schedule.py`
-- `WORKBUDDY_TASK.md` for the completion report
-
-Only touch another file if it is strictly required to implement or test these fixes, and document why.
+Do not redesign unrelated UI or backend architecture.
 
 ---
 
-## Issue A — ESP32-CAM JPEG frame integrity / concurrency
+## Phase 1 — instrument and locate the freeze on the actual RLCD
 
-### Current risk observed by ChatGPT
+Do not guess which final segment is failing. Prove it on M1 + RLCD hardware.
 
-The current design has two JPEG buffers, but metadata and network serving are not a complete frame-ownership protocol.
+Add minimal diagnostic telemetry sufficient to distinguish these stages:
 
-Current pattern includes shared state similar to:
-- `g_last_jpeg[2]`
-- one shared `g_last_len`
-- `g_jpeg_idx`
-- `g_last_seq`
+1. Mac `/api/camframe` response changes.
+2. RLCD `fetch_jpeg()` succeeds and receives a complete JPEG.
+3. Received JPEG bytes actually change between frames (use a cheap checksum/hash/CRC or equivalent diagnostic; do not rely only on Content-Length).
+4. JPEG decode succeeds.
+5. A decoded frame is published to the RLCD frame buffer.
+6. Published sequence number advances.
+7. UI timer observes the new sequence and requests redraw.
 
-The grab task writes the non-current buffer, then updates length/index/sequence. HTTP handlers later snapshot an index and serve from that buffer.
+Diagnostics should be rate-limited so serial logging itself does not destroy frame rate.
 
-There are two distinct risks to verify and fix:
+### Required JPEG/decode correctness checks
 
-1. **Metadata mismatch:** a reader can observe an index associated with one frame and a shared length associated with another frame if publication is not coherent.
-2. **Buffer reuse during network send:** even if length becomes per-buffer, a slow reader may still be sending buffer A after the grabber has published B and then starts reusing A for a later frame. Therefore, merely changing `g_last_len` into `g_last_len[2]` is not automatically a complete fix.
+- Validate JPEG SOI **and EOI**, not only `FF D8` at the beginning.
+- Inspect the real return value/result of `TJpgDec.drawJpg()`.
+- Only swap/publish the frame buffer and increment the public frame sequence after a successful decode.
+- A failed/partial decode must not masquerade as a new valid frame.
 
-### Required behavior
+### Required freshness model
 
-A served JPEG must be an immutable, internally consistent snapshot for the entire network write:
-- buffer bytes belong to one frame;
-- length belongs to that same frame;
-- sequence belongs to that same frame;
-- grabber cannot overwrite the bytes while the HTTP handler is sending them.
+Do not use one global one-shot `g_new_frame` consumption flag because there are multiple consumers (full camera page and home thumbnail).
 
-### Implementation guidance
+Use sequence + timestamp semantics instead:
+- maintain last successful decoded/published frame timestamp;
+- `cam_client_get_frame()` may copy the latest valid frame and return its sequence;
+- each UI consumer remembers its own last sequence;
+- a camera frame is considered fresh/online only if the sequence has advanced recently (choose and document a sensible threshold, e.g. a few seconds);
+- if sequence is stale, status must show stale/offline/retrying rather than resetting failure state just because an old buffer can still be copied.
 
-Choose the smallest robust design after inspecting the real code.
-
-A preferred simple approach is:
-- maintain latest-frame storage owned by the grabber;
-- use a mutex/critical section only for the short memory-copy/snapshot operation;
-- copy the current JPEG into a dedicated send/staging buffer while protected;
-- release the lock before any potentially slow `client.write()` / network operation;
-- serve the staging snapshot unlocked.
-
-This avoids holding a camera/grabber lock across WiFi transmission while also preventing frame mutation during send.
-
-An equivalent design is acceptable if it proves the same ownership guarantees. Do not add unnecessary architecture layers.
-
-### Also inspect while in this code
-
-- `/capture` and `/stream` must use the same safe snapshot semantics.
-- The no-frame `503` response should advertise the actual connection behavior. If the handler closes the connection after one request, do not claim `Connection: keep-alive`.
-- Preserve the existing native `WiFiServer` architecture unless a concrete defect requires changing it.
-- Do not tune JPEG quality/frame size in this task unless required to reproduce or fix the transport defect.
+The frozen last frame may remain displayed during a temporary outage, but the software must know and report that it is stale.
 
 ---
 
-## Issue B — Mac backend MJPEG reconnect parser state
+## Phase 2 — fix live-frame recovery
 
-### Current risk observed by ChatGPT
+After instrumentation identifies the actual stop point, fix the smallest real cause.
 
-In `rlcd-lvgl/parse_schedule.py`, camera MJPEG parsing uses `_recv_buf` as shared receive state. `_recv_line()` explicitly operates on the global buffer, while the reconnect/error path in `_cam_grabber_loop()` assigns `_recv_buf = b""` without clearly sharing the same binding.
+At minimum, address:
+- stale `g_new_frame` semantics;
+- unreachable two-stage self-heal logic;
+- any confirmed `fetch_jpeg()`/decode/publication issue revealed by the serial evidence.
 
-In Python, if `_cam_grabber_loop()` assigns `_recv_buf` without `global _recv_buf`, that assignment is local to the function. The parser's real global receive buffer can therefore retain bytes from a dead connection across reconnects.
+If RLCD fetches repeatedly fail while Mac `/api/camframe` is healthy, inspect the actual short-connection behavior from RLCD to M1 rather than blaming the camera upstream.
 
-That can contaminate the next multipart stream and produce invalid framing, delayed recovery, stale/garbled JPEGs, or repeated reconnect loops.
+If RLCD sequence advances continuously but the physical image remains frozen, inspect LVGL image refresh/cache/invalidation behavior and fix that specific path.
 
-### Required behavior
-
-After any stream disconnect/error/reconnect:
-- parser state for the dead socket must be discarded;
-- the new socket must start from an empty receive buffer;
-- response headers must be parsed from the new connection only;
-- multipart frame boundaries/lengths must not be mixed across sockets;
-- the backend must resume caching valid JPEGs without requiring a backend process restart.
-
-### Implementation guidance
-
-At minimum, fix the actual scope bug if confirmed.
-
-Prefer making receive-buffer state local to the active stream/parser rather than a process-global variable if this can be done cleanly without a large refactor. A small class/local closure/helper object is acceptable, but do not redesign the backend.
-
-Also verify that the initial `/stream` response is actually successful before treating subsequent bytes as multipart frame data. Do not blindly parse a non-200 HTTP response as MJPEG.
-
-Do not change unrelated schedule/stocks/weather backend behavior.
+Do not claim the freeze is fixed until the **physical display visibly changes while the camera scene changes**.
 
 ---
 
-## Validation required
+## Phase 3 — correct the 1-bit rendering pipeline
 
-### 1. Static / code review
+### Required processing order
 
-Before building, explain in the execution report:
-- the exact ESP32-CAM race you confirmed in the old code;
-- the ownership/snapshot rule used in the fix;
-- the exact Python `_recv_buf` scope/reconnect defect confirmed or disproved;
-- any difference between ChatGPT's hypothesis and the real code.
+Target order:
 
-Do not mechanically implement a hypothesis that is not supported by the actual source.
+**JPEG → grayscale/intensity → resize/downsample to the final display dimensions → contrast/gamma if needed → 1-bit conversion/dither → LVGL display**
 
-### 2. Build checks
+Not:
 
-Run:
-- ESP32-CAM PlatformIO build — must PASS.
-- RLCD PlatformIO build — must still PASS, even if RLCD C++ code is untouched.
-- Python syntax/import check for `rlcd-lvgl/parse_schedule.py` sufficient to catch syntax/name errors introduced by the change.
+**JPEG → dither to 1-bit → nearest-neighbor resize**
 
-Record meaningful warnings/errors.
+### Preferred implementation
 
-### 3. Real camera/backend test on M1
+Use a grayscale intermediate frame on the ESP32-S3 if practical. This board has PSRAM and a 320x240 8-bit grayscale buffer is only about 76.8 KB.
 
-The ESP32-CAM serial adapter was present during RLCD-001, so perform a real transport test if the hardware remains available.
+A clean minimal design is acceptable where:
+- decoder produces/publishes grayscale (or equivalent intensity) data plus sequence/timestamp;
+- full camera page renders 320x240 from grayscale then converts to 1-bit;
+- thumbnail first downsamples grayscale to its actual final dimensions using box/area averaging or another sensible low-cost resampler, then performs the 1-bit conversion;
+- `scale_1bit()` is no longer used to shrink an already-dithered photo.
 
-Required test sequence:
+Equivalent implementations are allowed if they preserve the same rule: **resize first, dither last**.
 
-1. Flash the ESP32-CAM only if necessary to test the firmware fix. Record whether flashing was performed and result.
-2. Start the Mac backend normally.
-3. Confirm the backend receives valid JPEG frames from the ESP32-CAM stream.
-4. Confirm `/api/camframe` repeatedly returns valid JPEG data while the upstream stream is healthy.
-5. Exercise a real reconnect at least once. Examples:
-   - temporarily reset/power-cycle the ESP32-CAM, or
-   - otherwise deliberately break the upstream camera stream without damaging configuration.
-6. Confirm the backend reconnects and resumes valid frames **without restarting the backend process**.
-7. After recovery, continue the test long enough to establish that frames keep advancing rather than merely serving one stale frame.
-8. Check serial/backend logs for crashes, watchdog loops, corrupted-frame errors, obvious reconnect thrashing, or resource exhaustion.
+### Source frame scaling / crop
 
-If a required physical device is unavailable, do not fabricate PASS. Mark that part BLOCKED and complete all non-hardware validation.
+Current code decodes 640x480 and takes a center 320x240 crop, effectively producing a 2x zoom.
 
-### 4. Regression boundaries
+Inspect whether `TJpg_Decoder` in the actual project supports reliable half-scale decode (`setJpgScale(2)` or equivalent). If yes, prefer using the full 640x480 field downscaled to 320x240 rather than throwing away the outer image with the current central crop. This should reduce work and generally improve scene recognizability.
 
-Verify that:
-- `/status` remains available on ESP32-CAM;
-- `/capture` remains functional if it is part of the current public contract;
-- `/stream` remains functional for the Mac backend;
-- schedule/stocks/weather backend routes are not intentionally changed;
-- no camera image-quality parameters were altered just to make the test look better.
+If library behavior makes this unsafe, keep the crop temporarily and document why.
+
+### 1-bit algorithm
+
+First fix the threshold-domain bug. Do not tune around a mathematically invalid formula.
+
+For the initial corrected implementation:
+- use a mathematically correct Bayer threshold mapped to the same `0..255` domain as luminance, **or** another simple stable 1-bit algorithm that performs better on the physical RLCD;
+- avoid the current hard-coded 200% contrast unless real comparison proves it helps;
+- prioritize recognizable shapes, faces/objects, and motion over simulated gray smoothness.
+
+Because this is a live reflective 1-bit display, temporal stability matters. Avoid an unnecessarily expensive algorithm that makes every frame shimmer violently.
+
+A small host-side comparison using one real captured JPEG is allowed if useful (e.g. corrected Bayer vs simple threshold vs error diffusion), but do not build a large image-processing framework.
+
+---
+
+## Real-hardware validation — mandatory
+
+This task is not complete with build-only or backend-only tests.
+
+### A. Build
+
+- RLCD PlatformIO build: PASS required.
+- ESP32-CAM regression build: PASS required even if unchanged.
+- Python backend syntax/regression check: PASS if backend is touched; otherwise note unchanged.
+
+### B. Flash
+
+Flash the updated **RLCD firmware** to the real RLCD device.
+
+Flash ESP32-CAM only if its code is actually changed.
+
+### C. Live motion test
+
+With the real camera pointed at a scene containing obvious movement (hand movement is sufficient):
+
+- run for at least 60 seconds;
+- confirm RLCD-side successful decoded/published sequence continues advancing;
+- record approximate observed frame cadence;
+- there must not be a permanent one-frame freeze;
+- a temporary network gap must recover automatically;
+- if a gap exceeds the freshness threshold, UI/status must report stale/offline rather than falsely online.
+
+Record serial evidence sufficient to prove where frames advance.
+
+### D. Physical image-quality test
+
+On the actual RLCD:
+- verify major objects/person silhouette are recognizable;
+- verify the image is not dominated by the previous malformed gray-dot pattern;
+- verify thumbnail (if active in current UI) is processed from pre-dither intensity data or otherwise no longer performs nearest-neighbor scaling of an already-dithered camera image;
+- verify full camera page and thumbnail both update when their UI is active.
+
+The owner-visible result is the acceptance criterion. If the screen is still essentially unrecognizable, mark image-quality validation FAIL and report what remains; do not write PASS just because the algorithm is mathematically cleaner.
+
+### E. Regression
+
+Confirm:
+- schedule/stocks/weather UI still works;
+- camera page navigation still works;
+- no significant PSRAM allocation failure;
+- no watchdog/reset loop introduced;
+- no large frame-rate collapse from image processing.
 
 ---
 
 ## Restrictions
 
-For RLCD-002:
-
-- Do not redesign the UI.
-- Do not change Bayer dithering yet.
-- Do not change RLCD thumbnail/fullscreen scaling yet.
-- Do not fix RLCD camera freshness/online indicator yet unless a change is strictly necessary for transport testing.
-- Do not perform broad refactors.
 - Do not modify `main`.
-- Do not force-push.
-- Do not merge branches.
-- Do not commit credentials, real meeting data, local WiFi configuration, serial dumps containing secrets, or generated build output.
-- If you find a new issue outside scope, record it under `New findings` but do not fix it unless it blocks this task.
+- Do not force-push or merge branches.
+- Do not redesign the whole UI.
+- Do not revert the RLCD-002 ESP32-CAM/Mac transport fixes unless a concrete regression is proven.
+- Do not change camera hardware resolution/JPEG quality merely to hide an RLCD rendering bug unless measured evidence requires it.
+- Do not introduce heavyweight computer-vision libraries.
+- Do not commit local WiFi credentials, local host configuration, real schedule data, or build artifacts.
+- Keep changes focused on the live-frame and rendering path.
+
+---
+
+## Expected files
+
+Likely:
+- `rlcd-lvgl/src/cam_client.cpp`
+- `rlcd-lvgl/src/cam_client.h`
+- `rlcd-lvgl/src/ui_camera.cpp`
+- `WORKBUDDY_TASK.md`
+
+Touch other files only when required and document why.
 
 ---
 
 ## Completion report
 
-Replace the TBD fields below with real results before committing.
+Replace the TBD fields before committing.
 
 ### Execution report
 
-- **Status:** DONE (executed by WorkBuddy on M1; pending ChatGPT review)
-- **Starting HEAD:** `6a9eecf`
-- **Files changed:** `esp32-cam-fw/src/main.cpp` (Issue A), `rlcd-lvgl/parse_schedule.py` (Issue B), this file
-- **Issue A confirmed root cause:** confirmed. Grab task wrote the non-current buffer then updated shared `g_last_len` + `g_jpeg_idx` with **no lock**; HTTP handlers snapshotted `idx` and later read the *shared* `g_last_len`, so a reader could pair buffer A with length B (metadata mismatch). Worse, during a slow `client.write()` the grabber could publish the other buffer, swap `idx`, and on the next frame **reuse the buffer currently being sent** → bytes mutated mid-send (torn/corrupt JPEG).
-- **Issue A fix:** three-buffer snapshot protocol with a short critical section: (1) grabber publishes under `g_frame_mutex` (memcpy + len/idx/seq updated atomically); (2) new `snapshot_latest()` copies the current frame into a dedicated `g_send_jpeg` staging buffer under the same mutex, exporting `g_send_len`/`g_send_seq`; (3) HTTP handlers release the lock *before* any network write and serve the immutable staging snapshot (`/capture` and `/stream` both). Single-threaded HTTP loop means one staging buffer is sufficient. Also fixed the no-frame `503` to advertise `Connection: close` (server is connect-and-close), matching actual behavior. `g_frame_mutex` (FreeRTOS) + third PSRAM buffer allocated in `setup()`.
-- **Issue B confirmed root cause:** confirmed. `_recv_buf` is a module-global; `_cam_grabber_loop`'s `_recv_buf = b""` on the error path has **no `global` declaration** (function-local assignment), so the real global buffer retained bytes from the dead connection across reconnects → contaminated next multipart stream. Additionally, the initial `/stream` response was parsed into a *local* `header` variable (swallowing any bytes received past the header end, i.e. the first boundary), and the status line was **never checked for 200**.
-- **Issue B fix:** receive-buffer state is now connection-local: `_cam_grabber_loop` creates a fresh `bytearray()` per new socket, and `_recv_line(sock, buf)` / `_cam_read_multipart(sock, buf)` operate on it (in-place consume). On error the local `buf` is dropped, so a reconnect starts from an empty buffer. The `/stream` response status line is validated (`200`) before multipart parsing, and headers + body now share the same buffer (no byte loss). Module-global `_recv_buf` removed.
-- **ESP32-CAM build:** PASS — env `esp32cam`; RAM 16.3% (53500 B) / Flash 30.5% (959157 B); no relevant warnings
-- **RLCD build regression check:** PASS — env `esp32-s3-rlcd`; RAM 42.6% (139732 B) / Flash 64.2% (2144177 B); RLCD C++ untouched this round
-- **Python check:** PASS — `py_compile` + `import parse_schedule` OK; `_recv_buf` global confirmed removed
-- **ESP32-CAM flashed:** YES — with user's help holding IO0 (boot mode 0xa otherwise); 966064 bytes written, hash verified
-- **Healthy stream test:** PASS — backend received valid 640×480 baseline JPEGs; `/api/camframe` returned 200 + valid JPEG on 5 consecutive requests
-- **`/api/camframe` repeated-frame test:** PASS — repeated 200 responses; md5 kept changing across samples (frames advancing, not a stale single frame)
-- **Forced reconnect test:** PASS — triggered ESP32-CAM reset via serial (power-cycle equivalent); backend kept serving last-good frame during the outage, then **automatically reconnected and resumed** receiving frames without a backend restart
-- **Post-reconnect frame advancement:** PASS — md5 sequence `3fc143d7 → 85ca9a97 → a801f579` with sizes 15797 → 32500 → 49951 bytes after reconnect
-- **Serial/backend log result:** no crashes, watchdog loops, corrupt-frame errors, or resource exhaustion observed in serial/backend logs
-- **Regression checks:** `/status` OK (when reachable), `/capture` OK (200 + valid JPEG), `/stream` functional (backend keeps pulling it), `/api/schedule` `/api/stocks` `/api/weather_qh` all 200 and unchanged; no image-quality parameters altered
-- **New findings:** (1) `/api/health` returns 404 though startup banner advertises it — pre-existing, out of scope, not fixed. (2) Under the office AP (BTWIFI6) the ESP32-CAM's own WiFi link is unstable (direct `/status` short connections intermittently fail; frames advance but slowly) — pre-existing environment issue, not introduced by this change.
-- **Blockers / not tested:** none blocking. Full sustained high-frame-rate observation is limited by the BTWIFI6 environment's weak ESP32-CAM link (hardware/network condition), not by the transport fixes.
+- **Status:** TBD
+- **Starting HEAD:** TBD
+- **Files changed:** TBD
+- **Freeze stop-point proven:** TBD
+- **RLCD JPEG fetch evidence:** TBD
+- **JPEG changing/checksum evidence:** TBD
+- **JPEG decode result handling:** TBD
+- **Frame freshness/sequence fix:** TBD
+- **Self-heal fix:** TBD
+- **LVGL refresh finding/fix:** TBD
+- **Image pipeline before:** TBD
+- **Image pipeline after:** TBD
+- **Bayer/1-bit algorithm fix:** TBD
+- **Thumbnail scaling fix:** TBD
+- **RLCD build:** TBD
+- **ESP32-CAM regression build:** TBD
+- **RLCD flashed:** TBD
+- **60s live-motion test:** TBD
+- **Observed RLCD frame cadence:** TBD
+- **Stale/offline behavior:** TBD
+- **Physical image recognizability:** TBD
+- **PSRAM/runtime stability:** TBD
+- **Regression checks:** TBD
+- **Remaining defects:** TBD
+- **Blockers / not tested:** TBD
 
 ## Git checkpoint
 
 After validation:
 
-1. Review `git diff` carefully.
-2. Confirm changes are limited to RLCD-002 scope plus this execution report.
-3. Commit on `workbuddy-development`.
-4. Suggested commit message:
-   - `fix(camera): harden frame snapshots and stream reconnect`
-5. Push to `origin/workbuddy-development`.
-6. Do not merge to `main`.
-7. After push, stop. Do not start RLCD-003 yourself.
+1. Review `git diff` and ensure changes are within RLCD-003 scope.
+2. Commit on `workbuddy-development`.
+3. Suggested commit message:
+   - `fix(rlcd-camera): restore live frames and correct 1bit rendering`
+4. Push to `origin/workbuddy-development`.
+5. Do not merge to `main`.
+6. After push, stop. Do not start RLCD-004 yourself.
 
 ## Done definition
 
-RLCD-002 is complete when:
-- served ESP32-CAM JPEGs have a correct frame-ownership/snapshot guarantee;
-- the Mac MJPEG parser cannot carry stale socket receive state into a reconnect;
-- both firmware builds pass;
-- Python validation passes;
-- real reconnect behavior is validated when hardware is available;
-- the execution report is complete;
-- the result is committed and pushed to `origin/workbuddy-development`.
+RLCD-003 is complete only when:
+- the actual RLCD-side freeze stop-point has been proven, not guessed;
+- stale-frame semantics are fixed;
+- successful decoded/published frame sequence keeps advancing on real hardware;
+- physical RLCD visibly updates with scene motion for the sustained test;
+- 1-bit threshold mathematics is correct;
+- image is resized before final 1-bit dithering/conversion;
+- physical image is materially more recognizable than the current gray-dot result;
+- builds and regression checks pass;
+- results are documented here and pushed to `origin/workbuddy-development`.
