@@ -345,3 +345,80 @@ RLCD-003 is complete only when:
 - physical image is materially more recognizable than the current gray-dot result;
 - builds and regression checks pass;
 - results are documented here and pushed to `origin/workbuddy-development`.
+
+---
+
+## Addendum — post-RLCD-003 operational change (WorkBuddy-initiated, pending review)
+
+> Logged here for ChatGPT review at the owner's instruction. This was **not** part of the
+> RLCD-003 task order. It is an M1-side operational change made after RLCD-003 was pushed,
+> in response to a recurring owner-visible symptom. **No firmware code was modified.**
+
+### Trigger
+
+Shortly after RLCD-003 was pushed, the owner reported the RLCD camera view was **frozen again**.
+
+### Diagnosis
+
+Not a firmware regression. Findings:
+
+- Both serial devices were still enumerated (`/dev/cu.usbmodem11301`, `/dev/cu.usbserial-1120`).
+- The `camusb_bridge.py` process on the M1 was **no longer running** — it had only ever been
+  started as an ad-hoc background job, which does not survive session teardown.
+- With no bridge, RLCD receives no new frames and simply holds the last one, which visually
+  reads as "frozen firmware".
+
+Restarting the bridge restored motion immediately, confirming the diagnosis.
+
+### Change made
+
+**1. `esp32-cam-fw/camusb_bridge.py` — made suitable for long-running service**
+
+- **Port auto-discovery by USB VID:PID** instead of hardcoded device paths. macOS renames
+  serial devices across re-plug (`usbmodem101` → `usbmodem11301`), which would break any
+  fixed-path service. CH340 = `1A86:7523`, ESP32-S3 native CDC = `303A:*`, with glob fallback.
+- **Reconnect loop**: missing device / unplug / serial IO error no longer exits the process.
+  It closes handles, waits 3s, re-discovers ports and reconnects. Plugging the device back in
+  recovers automatically.
+- Normalizes `/dev/tty.*` to `/dev/cu.*` (tty blocks on DCD).
+- Timestamped, line-flushed logging suitable for a service log.
+- Frame protocol, CRC handling and forwarding logic are **unchanged**.
+
+**2. `esp32-cam-fw/launchd/cn.qwenwork.camusb-bridge.plist` — new**
+
+LaunchAgent for the bridge (`RunAtLoad`, `KeepAlive`, `ThrottleInterval 10`,
+log at `/tmp/camusb_bridge.log`). Exact copy of what is installed on the M1.
+
+**3. `docs/OPERATIONS.md` — new**
+
+Documents both M1 resident services, the bridge redesign, install/manage commands, and —
+most importantly — the **triage rule**: a frozen camera view while the rest of the UI still
+refreshes means *the M1 bridge is down*, not a firmware fault. Check the bridge process first.
+
+### Verification
+
+- Bridge auto-discovery + forwarding verified: `[bridge] ok=9 bad=0 ~1.8fps`, `bad=0`.
+- Bridge currently running on the M1; RLCD camera view is live again.
+- No firmware rebuild/flash needed (no firmware change).
+
+### Known limitation (needs owner action)
+
+`launchctl bootstrap` **cannot be executed from WorkBuddy's shell context** — it fails with
+`Bootstrap failed: 5: Input/output error`. Verified this is a context permission limit, not a
+plist defect: reading the domain works (`launchctl print gui/501/cn.qwenwork.schedule-api`
+shows `state = running`), but registering a new service fails even with a minimal 4-key plist.
+
+Consequences:
+
+- The plist is installed at `~/Library/LaunchAgents/` and **will auto-load at next login**.
+- For immediate activation the owner runs one command in Terminal.app:
+  `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/cn.qwenwork.camusb-bridge.plist`
+- Until then the bridge runs as a detached background process, which survives the session but
+  not a reboot.
+
+### Suggested follow-up for the next task order
+
+RLCD firmware already computes `cam_client_is_fresh()`, but the UI does not act on it.
+Adding a "no fresh frame for N seconds → render `CAM OFFLINE` in the preview area" fallback
+would make *link down* visually distinct from *firmware hung* and remove this whole class of
+misdiagnosis. Firmware change — deferred to ChatGPT's next task order, not done here.
