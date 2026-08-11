@@ -35,12 +35,29 @@ constexpr uint32_t RETRY_BACKOFF_MS  = 2000;  /* 连续失败后的退避间隔�
  * RLCD-003：解码只输出 8bit 灰度强度（不在此处抖动），1-bit 转换
  * 由 UI 侧在最终显示尺寸上完成（先缩放后抖动）。 */
 uint8_t  *g_gray[2] = { nullptr, nullptr };
-uint8_t  *g_jpeg    = nullptr;
 volatile uint8_t  g_read_idx  = 0;   /* LVGL 侧可读 */
 volatile uint8_t  g_write_idx = 1;
 volatile uint32_t g_seq       = 0;
 volatile uint32_t g_pub_ms    = 0;   /* 最近成功发布时刻（新鲜度） */
 bool      g_ready = false;
+
+#ifdef CAM_USB_INPUT
+/* ---- RLCD-004.2：RX 消费与解码解耦（S3 双核） ----
+ * 根因：单线程里"解码(1~1.5s)期间不读 USB RX"会让 bridge 写入的帧+命令积压，
+ * 32KB CDC 队列在解码窗口内被灌满溢出 -> 命令乱序/迟到、帧 CRC 错（bad++）。
+ * 修复：新增 rx_task（core0 高优先）持续 pump USB-CDC：帧间隙命令即时喂
+ * cmd_feed（回 ACK），完整帧写入 PSRAM 环形帧槽；cam_task 只做解码发布。
+ * 命令处理与解码彻底解耦 -> 任意时刻命令 ≤50ms 被处理，RX 队列永不积压。 */
+#define FRAME_SLOTS 4
+uint8_t *g_jpeg[FRAME_SLOTS] = { nullptr };
+uint8_t *g_rx_buf = nullptr;                        /* RX 任务独立接收缓冲（避免覆盖未读槽） */
+volatile int    g_ring_w = 0;                       /* rx_task 写索引 */
+volatile int    g_ring_r = 0;                       /* cam_task 读索引 */
+volatile size_t g_ring_len[FRAME_SLOTS] = { 0 };
+SemaphoreHandle_t g_frame_sem = nullptr;
+#else
+uint8_t *g_jpeg[1] = { nullptr };                    /* WiFi 模式单槽 */
+#endif
 
 /* ---- 诊断（限速打印用） ---- */
 volatile uint32_t g_last_sum = 0;    /* 最近发布帧的简单 checksum（字节和） */
@@ -70,6 +87,9 @@ void cmd_feed(uint8_t c)
             if (page >= 0) {
                 g_page_req = page;
                 Serial.printf("[cmd] %s -> page %d\n", g_cmd_buf, (int)page);
+                /* RLCD-004.2：收到命令即回 ACK（无论是否真切页），让 M1 确认投递。
+                 * 即便已在目标页也回对应 ACK，使 M1 的 confirmed_page 与真实设备对齐。 */
+                Serial.printf("ACK:%s\n", g_cmd_buf);
             }
             g_cmd_len = 0;
         }
@@ -277,7 +297,7 @@ size_t fetch_jpeg(const String &url)
     while (total < (size_t)content_length && millis() - t0 < 4000) {
         size_t avail = conn.available();
         if (avail > 0) {
-            size_t n = conn.read(g_jpeg + total,
+            size_t n = conn.read(g_jpeg[0] + total,
                                  min(avail, (size_t)content_length - total));
             total += n;
         } else {
@@ -293,31 +313,34 @@ size_t fetch_jpeg(const String &url)
     }
 
     if (total < 4) return 0;
-    if (g_jpeg[0] != 0xFF || g_jpeg[1] != 0xD8) {
+    if (g_jpeg[0][0] != 0xFF || g_jpeg[0][1] != 0xD8) {
         Serial.println("[cam] not a JPEG stream");
         if (g_mdns_ok) g_mdns_ms = 0;
         return 0;
     }
     /* RLCD-003：校验 EOI（FFD9）——只有 SOI 的半帧/损坏帧不得当作有效 JPEG */
-    if (g_jpeg[total - 2] != 0xFF || g_jpeg[total - 1] != 0xD9) {
-        Serial.printf("[cam] missing EOI (tail %02X %02X)\n", g_jpeg[total-2], g_jpeg[total-1]);
+    if (g_jpeg[0][total - 2] != 0xFF || g_jpeg[0][total - 1] != 0xD9) {
+        Serial.printf("[cam] missing EOI (tail %02X %02X)\n", g_jpeg[0][total-2], g_jpeg[0][total-1]);
         if (g_mdns_ok) g_mdns_ms = 0;
         return 0;
     }
     return total;
 }
 
-/* ★ USB-CDC 收帧：从 RLCD 的 USB 串口读取一帧 JPEG（M1 转发脚本写入）。
+/* ★ USB-CDC pump：收帧 + 帧间隙命令解析一体化（RLCD-004.2 重构）。
  * 帧协议与摄像头串口直传一致：AA 55 5A A5 | len(2B BE) | JPEG | crc16(2B BE, len+data 累加)
- * 状态机解析（static 保持跨调用状态）；成功返回 JPEG 长度，超时返回 0。
+ * 与旧 fetch_usb_frame 的差异：不再"只在读帧阶段跑"，而是可随时以时间分片被
+ * cam_task 调用（收帧/等待阶段都调）。命令字节到达后最多等一个 ~50ms 分片即被
+ * cmd_feed 处理并回 ACK，消除"解码/等待期间命令积压 -> 背压 -> 延迟放大"的根因。
+ * 状态机 static 保持跨调用（帧中途截断也能续传）；成功返回 JPEG 长度，超时返回 0。
  * USB-CDC 全双工：RX 收帧与 Serial.printf 日志(TX)互不干扰。 */
-static size_t fetch_usb_frame(uint8_t *dst, size_t cap, uint32_t timeout_ms)
+static size_t usb_pump_frame(uint32_t ms)
 {
     enum { S_H0, S_H1, S_H2, S_H3, S_LENH, S_LENL, S_BODY, S_CRCH, S_CRCL, S_DONE } st = S_H0;
     static size_t frame_len = 0, got = 0;
     static uint16_t crc_calc = 0;
     uint32_t t0 = millis();
-    while (millis() - t0 < timeout_ms) {
+    while (millis() - t0 < ms) {
         while (Serial.available()) {
             uint8_t c = (uint8_t)Serial.read();
             switch (st) {
@@ -331,13 +354,13 @@ static size_t fetch_usb_frame(uint8_t *dst, size_t cap, uint32_t timeout_ms)
                 case S_LENH: frame_len = ((size_t)c) << 8; st = S_LENL; break;
                 case S_LENL:
                     frame_len |= c;
-                    if (frame_len == 0 || frame_len > cap) { st = S_H0; break; }
+                    if (frame_len == 0 || frame_len > JPEG_BUF_SIZE) { st = S_H0; break; }
                     crc_calc = (uint16_t)(frame_len & 0xFFFF);
                     got = 0;
                     st = S_BODY;
                     break;
                 case S_BODY:
-                    if (got < frame_len && got < cap) dst[got++] = c;
+                    if (got < frame_len) g_rx_buf[got++] = c;
                     crc_calc = (uint16_t)(crc_calc + c);
                     if (got >= frame_len) st = S_CRCH;
                     break;
@@ -353,8 +376,31 @@ static size_t fetch_usb_frame(uint8_t *dst, size_t cap, uint32_t timeout_ms)
         }
         vTaskDelay(pdMS_TO_TICKS(1));
     }
-    return 0;   /* 超时无完整帧 */
+    return 0;   /* 分片内无完整帧 */
 }
+
+#ifdef CAM_USB_INPUT
+/* ★ RLCD-004.2：USB RX 消费任务（core0 高优先）。
+ * 持续 pump USB-CDC：帧间隙命令即时喂 cmd_feed（回 ACK）；完整帧存入 PSRAM
+ * 环形帧槽并 give 信号量给解码任务。与解码任务解耦 -> 命令处理不等待解码，
+ * RX 队列不再因解码窗口积压溢出。 */
+void rx_task(void *arg)
+{
+    for (;;) {
+        size_t len = usb_pump_frame(50);
+        if (len > 0) {
+            /* 环满时丢弃新帧（保护 cam_task 尚未读取的槽，绝不覆盖）。
+             * rx_task 继续消费 RX -> 命令解析始终不受影响；解码跟不上只是丢帧。 */
+            if (uxSemaphoreGetCount(g_frame_sem) < FRAME_SLOTS) {
+                memcpy(g_jpeg[g_ring_w], g_rx_buf, len);
+                g_ring_len[g_ring_w] = len;
+                g_ring_w = (g_ring_w + 1) % FRAME_SLOTS;
+                xSemaphoreGive(g_frame_sem);
+            }
+        }
+    }
+}
+#endif  /* CAM_USB_INPUT */
 
 void cam_task(void *arg)
 {
@@ -364,15 +410,18 @@ void cam_task(void *arg)
         uint32_t start = millis();
 
 #ifdef CAM_USB_INPUT
-        /* USB 全链路视频模式：不依赖 WiFi，从 USB-CDC 收帧（M1 转发脚本写入） */
-        size_t len = fetch_usb_frame(g_jpeg, JPEG_BUF_SIZE, 2000);
-        if (len > 0) {
+        /* USB 全链路视频模式：帧由 rx_task 收进 PSRAM 环形槽，这里只解码发布。
+         * RLCD-004.2：命令解析在 rx_task（独立于解码），命令延迟 ≤50ms。 */
+        if (xSemaphoreTake(g_frame_sem, 500) == pdTRUE) {
+            size_t len = g_ring_len[g_ring_r];
+            uint8_t *slot = g_jpeg[g_ring_r];
+            g_ring_r = (g_ring_r + 1) % FRAME_SLOTS;
             /* 解码 -> 灰度 -> 发布（仅解码成功且完整） */
             memset(g_gray[g_write_idx], 0, CAM_GRAY_BYTES);
             TJpgDec.setJpgScale(1);
             TJpgDec.setSwapBytes(true);
             TJpgDec.setCallback(tjpg_output);
-            JRESULT jr = TJpgDec.drawJpg(0, 0, g_jpeg, len);
+            JRESULT jr = TJpgDec.drawJpg(0, 0, slot, len);
             if (jr == JDR_OK) {
                 g_read_idx  = g_write_idx;
                 g_write_idx = 1 - g_read_idx;
@@ -411,7 +460,7 @@ void cam_task(void *arg)
                 TJpgDec.setJpgScale(1);
                 TJpgDec.setSwapBytes(true);
                 TJpgDec.setCallback(tjpg_output);
-                JRESULT jr = TJpgDec.drawJpg(0, 0, g_jpeg, len);
+                JRESULT jr = TJpgDec.drawJpg(0, 0, g_jpeg[0], len);
 
                 if (jr == JDR_OK) {
                     g_read_idx  = g_write_idx;
@@ -477,16 +526,29 @@ void cam_task(void *arg)
 
 void cam_client_init(void)
 {
-    if (g_jpeg) return;   /* 防重复初始化 */
+    if (g_jpeg[0]) return;   /* 防重复初始化 */
 
     g_gray[0] = static_cast<uint8_t *>(
         heap_caps_malloc(CAM_GRAY_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     g_gray[1] = static_cast<uint8_t *>(
         heap_caps_malloc(CAM_GRAY_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    g_jpeg = static_cast<uint8_t *>(
+    bool alloc_ok = (g_gray[0] && g_gray[1]);
+#ifdef CAM_USB_INPUT
+    for (int i = 0; i < FRAME_SLOTS && alloc_ok; i++) {
+        g_jpeg[i] = static_cast<uint8_t *>(
+            heap_caps_malloc(JPEG_BUF_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        alloc_ok = alloc_ok && (g_jpeg[i] != nullptr);
+    }
+    g_rx_buf = static_cast<uint8_t *>(
         heap_caps_malloc(JPEG_BUF_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    alloc_ok = alloc_ok && (g_rx_buf != nullptr);
+#else
+    g_jpeg[0] = static_cast<uint8_t *>(
+        heap_caps_malloc(JPEG_BUF_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    alloc_ok = alloc_ok && (g_jpeg[0] != nullptr);
+#endif
 
-    if (!g_gray[0] || !g_gray[1] || !g_jpeg) {
+    if (!alloc_ok) {
         Serial.println("[cam] PSRAM alloc failed, cam disabled");
         return;
     }
@@ -500,10 +562,16 @@ void cam_client_init(void)
      * 旧数据。TinyUSB 驱动层 64B 缓冲不用动（满了会 NAK 主机暂停传输，不丢）。 */
     Serial.setRxBufferSize(32768);
     Serial.println("[cam] USB input mode, CDC rx queue = 32KB");
-#endif
 
+    /* RLCD-004.2：rx_task(core0, 优先6) 持续消费 RX + 解析命令；
+     * cam_task(core1 由调度器安排, 优先4) 只做解码发布。命令与解码解耦。 */
+    g_frame_sem = xSemaphoreCreateCounting(FRAME_SLOTS, 0);
+    xTaskCreatePinnedToCore(rx_task, "camrx", 4096, nullptr, 6, nullptr, 0);
+    xTaskCreatePinnedToCore(cam_task, "camfetch", 8192, nullptr, 4, nullptr, 1);
+#else
     /* 栈 8192：VGA 640x480 全尺寸解码（TJpgDec 内部 MCU 缓冲 + 裁切）需要大栈 */
     xTaskCreate(cam_task, "camfetch", 8192, nullptr, 4, nullptr);
+#endif
     Serial.println("[cam] cam_client started (2fps, QVGA grayscale)");
 }
 

@@ -103,5 +103,40 @@ stream = [(True, 1)] * 4 + [(True, 2)] * 5
 check("S7 1指->2指 顺序正确 [HOME, MEETING]",
       simulate(trig, stream, 1.0) == ["PAGE:HOME", "PAGE:MEETING"])
 
+# ============================================================
+# RLCD-004.2：confirmed_page 权威化（修复"命令已发送即认为已切页"漂移）
+# 复现用户报告的 bug：TRIGGER PAGE:MEETING 后首条命令 ACK 丢失，RLCD 仍是 HOME；
+# 旧逻辑因 last_sent 乐观置为 MEETING，下一相同手势判 already-there 而永久跳过。
+# 预填窗口到 min_agree(3) 使 "enough" 成立，再断言决策（避免单帧 no-trigger 干扰）：
+def fill_window(trig, finger, base, n=3):
+    for i in range(n):
+        trig.window.append((finger, base - i))
+
+
+# S8：构造 drift —— last_sent 乐观=MEETING，但设备真实页 confirmed=HOME
+trig = FingerTrigger(min_agree=3, win_sec=3.0, cooldown=1.5)
+trig.last_sent = "PAGE:MEETING"          # 旧逻辑的乐观记录（漂移来源）
+trig.last_sent_t = 0.0
+fill_window(trig, 2, 100.0)
+dec, _, _ = trig.update(True, 2, 100.0, confirmed_page="PAGE:HOME")
+check("S8 drift: confirmed=HOME 举2指 仍触发(非 already-there)", dec == "trigger")
+
+# S9：confirmed 与 desired 一致 -> already-there，且不受无关 last_sent 干扰
+trig = FingerTrigger(min_agree=3, win_sec=3.0, cooldown=1.5)
+trig.last_sent = "PAGE:HOME"             # 与之无关的乐观值
+trig.last_sent_t = 0.0
+fill_window(trig, 2, 100.0)
+dec, _, _ = trig.update(True, 2, 100.0, confirmed_page="PAGE:MEETING")
+check("S9 confirmed=MEETING 举2指 -> already-there", dec == "already-there")
+
+# S10：confirmed=None 时回退乐观 last_sent（dry-run 兼容）
+trig = FingerTrigger(min_agree=3, win_sec=3.0, cooldown=1.5)
+trig.last_sent = "PAGE:MEETING"
+trig.last_sent_t = 0.0
+fill_window(trig, 2, 100.0)
+dec, _, _ = trig.update(True, 2, 100.0, confirmed_page=None)
+check("S10 confirmed=None 回退 last_sent 举2指 -> already-there(dry-run兼容)",
+      dec == "already-there")
+
 print(f"\n=== {PASS} passed, {FAIL} failed ===")
 sys.exit(1 if FAIL else 0)

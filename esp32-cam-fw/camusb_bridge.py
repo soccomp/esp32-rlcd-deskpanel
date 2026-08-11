@@ -80,16 +80,19 @@ def resolve_ports(cam_arg, rlcd_arg):
 
 
 class FrameHub:
-    """本地 TCP hub：向订阅者广播帧，并收集订阅者回传的命令。
+    """本地 TCP hub：向订阅者广播帧、收集命令、并转发 RLCD 回执(ACK)。
 
-    每个客户端只保留「最新一帧」（满则丢旧），慢客户端不会拖慢转发主循环。
+    RLCD-004.2 新增：RLCD 在收到 PAGE 命令后通过 USB-CDC TX 回 ``ACK:PAGE:X``，
+    本 hub 读取 RLCD 的 TX 并把 ACK 行广播给所有客户端，使 M1 端能确认投递。
+    每个客户端：帧走 frame_q（最新一帧，满则丢旧）；文本(ACK)走 text_q
+    （不丢弃、_send_loop 优先发送，避免被视频帧拖住）。
     命令走独立队列，由主循环统一写串口，避免多线程同时写 RLCD。
     """
 
     def __init__(self):
-        self._clients = []                  # [(sock, deque-like Queue(1))]
+        self._clients = []                  # [(conn, frame_q, text_q)]
         self._lock = threading.Lock()
-        self.commands = queue.Queue()       # 主循环消费
+        self.commands = queue.Queue()       # 主循环消费（PAGE 命令）
 
     def start(self):
         t = threading.Thread(target=self._serve, daemon=True)
@@ -111,34 +114,52 @@ class FrameHub:
             except OSError:
                 return
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            q = queue.Queue(maxsize=1)
+            fq = queue.Queue(maxsize=1)     # 帧（满丢旧）
+            tq = queue.Queue(maxsize=16)    # 文本(ACK)，不丢
             with self._lock:
-                self._clients.append((conn, q))
+                self._clients.append((conn, fq, tq))
             log(f"hub client connected ({len(self._clients)} total)")
-            threading.Thread(target=self._send_loop, args=(conn, q), daemon=True).start()
-            threading.Thread(target=self._recv_loop, args=(conn, q), daemon=True).start()
+            threading.Thread(target=self._send_loop, args=(conn, fq, tq),
+                             daemon=True).start()
+            threading.Thread(target=self._recv_loop, args=(conn, fq),
+                             daemon=True).start()
 
-    def _drop(self, conn, q):
+    def _drop(self, conn, fq, tq):
         with self._lock:
-            self._clients = [c for c in self._clients if c[1] is not q]
+            self._clients = [c for c in self._clients
+                             if not (c[0] is conn and c[1] is fq)]
         try:
             conn.close()
         except OSError:
             pass
 
-    def _send_loop(self, conn, q):
+    def _send_loop(self, conn, fq, tq):
         while True:
-            packet = q.get()
-            if packet is None:
-                return
+            # 优先发文本(ACK)：保证回执不被视频帧排队拖住
+            try:
+                data = tq.get_nowait()
+            except queue.Empty:
+                data = None
+            if data is not None:
+                try:
+                    conn.sendall(data)
+                except OSError:
+                    self._drop(conn, fq, tq)
+                    log("hub client disconnected (send text)")
+                    return
+                continue
+            try:
+                packet = fq.get(timeout=0.05)
+            except queue.Empty:
+                continue
             try:
                 conn.sendall(packet)
             except OSError:
-                self._drop(conn, q)
-                log("hub client disconnected (send)")
+                self._drop(conn, fq, tq)
+                log("hub client disconnected (send frame)")
                 return
 
-    def _recv_loop(self, conn, q):
+    def _recv_loop(self, conn, fq):
         buf = b""
         while True:
             try:
@@ -146,8 +167,7 @@ class FrameHub:
             except OSError:
                 chunk = b""
             if not chunk:
-                self._drop(conn, q)
-                q.put(None)
+                self._drop(conn, fq, fq)
                 log("hub client disconnected (recv)")
                 return
             buf += chunk
@@ -160,16 +180,33 @@ class FrameHub:
                     log(f"hub rejected command: {cmd!r}")
 
     def publish(self, packet):
+        """广播一帧 JPEG 给所有客户端（满则丢旧帧）。"""
         with self._lock:
             clients = list(self._clients)
-        for _, q in clients:
-            if q.full():                    # 慢客户端只丢旧帧，不阻塞主循环
+        for _, fq, _ in clients:
+            if fq.full():                    # 慢客户端只丢旧帧，不阻塞主循环
                 try:
-                    q.get_nowait()
+                    fq.get_nowait()
                 except queue.Empty:
                     pass
             try:
-                q.put_nowait(packet)
+                fq.put_nowait(packet)
+            except queue.Full:
+                pass
+
+    def publish_text(self, text):
+        """转发一行文本（如 RLCD 回执 ``ACK:PAGE:X``）给所有客户端，不丢弃。"""
+        data = text.encode("ascii") if isinstance(text, str) else text
+        with self._lock:
+            clients = list(self._clients)
+        for _, _, tq in clients:
+            try:
+                if tq.full():
+                    try:
+                        tq.get_nowait()
+                    except queue.Empty:
+                        pass
+                tq.put_nowait(data)
             except queue.Full:
                 pass
 
@@ -177,6 +214,7 @@ class FrameHub:
 def pump(cam, rlcd, hub):
     """一次连接内的转发循环；串口异常时抛出，由外层重连。"""
     buf = bytearray()
+    rlcd_line_buf = bytearray()     # RLCD TX 行缓冲（解析 ACK）
     ok = bad = 0
     last_report = time.time()
 
@@ -229,6 +267,38 @@ def pump(cam, rlcd, hub):
             rlcd.flush()
             log(f"cmd -> RLCD: {cmd}")
 
+        # RLCD-004.2：读取 RLCD 的 USB-CDC TX，把 ``ACK:PAGE:X`` 回执转发给 hub 客户端
+        rlcd_wait = rlcd.in_waiting
+        if rlcd_wait:
+            chunk = rlcd.read(rlcd_wait)
+            if chunk:
+                rlcd_line_buf.extend(chunk)
+                if len(rlcd_line_buf) > 512:       # 安全：丢弃异常长行
+                    rlcd_line_buf = rlcd_line_buf[-256:]
+                while b"\n" in rlcd_line_buf:
+                    line, rlcd_line_buf = rlcd_line_buf.split(b"\n", 1)
+                    s = line.strip().decode("ascii", "ignore")
+                    # RLCD-004.2 诊断：把 RLCD 的 [cmd]/[cam] 日志记入 bridge 日志，
+                    # 形成 ESP32 RX(收到) / UI SWITCH(切页) 的可见证据链；不转发给客户端
+                    if s.startswith("[cmd]") or s.startswith("[cam]"):
+                        log(f"rlcd: {s}")
+                    # ACK 提取：RLCD 的 Serial.printf 偶发与其它日志粘连/换行丢失
+                    # （如 "[cmd] PAGE:GUITAR -> paACK:PAGE:GUITAR"），行首匹配会漏掉，
+                    # 因此改为在整行内搜索 "ACK:PAGE:" 子串，粘连也能提取转发。
+                    k = 0
+                    while True:
+                        k = s.find("ACK:PAGE:", k)
+                        if k < 0:
+                            break
+                        e = k + 10                       # len("ACK:PAGE:")
+                        while e < len(s) and (s[e].isalpha() or s[e] == '_'):
+                            e += 1
+                        tok = s[k:e]
+                        if tok.startswith("ACK:") and tok[4:] in ALLOWED_CMDS:
+                            hub.publish_text(tok + "\n")
+                            log(f"ACK {tok} -> hub clients")
+                        k = e
+
         now = time.time()
         if now - last_report >= REPORT_EVERY:
             log(f"ok={ok} bad={bad} ~{ok / (now - last_report):.1f}fps")
@@ -266,6 +336,7 @@ def main():
             rlcd = serial.Serial(rlcd_port, RLCD_BAUD, timeout=0.1)
             time.sleep(0.3)
             rlcd.reset_output_buffer()
+            rlcd.reset_input_buffer()      # 丢弃 RLCD 启动期日志积压，只关心后续 ACK
 
             log(f"{cam_port}@{CAM_BAUD} -> {rlcd_port}@{RLCD_BAUD}")
             pump(cam, rlcd, hub)

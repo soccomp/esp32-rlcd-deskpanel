@@ -298,3 +298,56 @@ ESP32 侧确认：是否收到 PAGE 命令、是否执行页面切换（含"已�
 3. push 到 `workbuddy-development`
 
 完成后停止，等待审核。
+
+---
+
+# RLCD-004.2 Page Command Delivery Reliability
+
+## Task
+
+- **Task ID:** RLCD-004.2
+- **Status:** OPEN
+- **Branch:** `workbuddy-development`
+- **Priority:** P1
+- **Previous task:** RLCD-004.1 COMPLETE（真人验收已确认 M1 能识别手指数并产生 `TRIGGER: PAGE:X`，但 RLCD 经常不切页）
+
+## Problem（真人验收定位）
+
+M1 能输出 `TRIGGER: PAGE:MEETING` / `TRIGGER: PAGE:GUITAR`，但 RLCD 页面经常没变、仍停在首页；随后 M1 输出 `SKIP: PAGE:MEETING already current`。
+
+根因：M1 用 `last_sent`（命令"已发送"）乐观地当作"RLCD 已切页"。当首条命令在链路某层丢失、RLCD 未切页，M1 仍把 `last_sent` 置为目标页，下一相同手势被判 `already current` 而**永不再发**，sender 状态与真实设备状态漂移。这是 ACK-less 投递的必然结果。
+
+## Goal
+
+让 M1 只有在 RLCD 确认页面真正切换后，才认为当前页面已改变——实现「命令投递可靠性」。
+
+## Functional Requirement
+
+1. **RLCD 侧 ACK 回执**：收到 `PAGE:HOME/MEETING/GUITAR` 并经 USB-CDC 返回 `ACK:PAGE:HOME` / `ACK:PAGE:MEETING` / `ACK:PAGE:GUITAR`；**即使本来就在目标页，也返回对应 ACK**。
+2. **桥接转发**：`camusb_bridge` 读取 RLCD USB-CDC TX 中的 `ACK:PAGE:X`，转发给本地 hub 客户端。
+3. **M1 双状态**：`finger_page_control.py` 区分 `desired_page` 与 `confirmed_page`：
+   - 发送 `PAGE:X` 后**不允许**直接把 confirmed 改成 X；
+   - 只有收到 `ACK:PAGE:X` 后才确认该页真正生效；
+   - "Already current" 判断只基于 `confirmed_page`，不基于"曾经发过命令"。
+4. **超时重发**：`PAGE` 发出后 `ack_timeout`（默认 0.9s）内无 ACK → 自动重发，最多 `max_attempts`（默认 3）次；超时后明确日志 `PAGE ACK TIMEOUT`。不每帧重复刷命令。
+5. **不破坏**现有 JPEG/video bridge 帧协议；不优化摄像头画质；不扩展复杂手势；不重构 UI。
+
+## Validation
+
+1. 不依赖手势注入 `HOME → MEETING → GUITAR → HOME` 连续 ≥30 次，每次必须收到对应 ACK，不允许 sender 与 RLCD 状态漂移。
+2. 真人手势 1 指→HOME、2 指→MEETING、3 指→GUITAR，连续完成至少 1→2→3→1 三轮。
+3. 特别验证命令第一次丢失时能自动重发，而不是错误进入 "already current"。
+4. 端到端日志需完整可见：`TRIGGER` / `SEND` / `ESP32 RX` / `UI SWITCH` / `ACK` / `CONFIRMED`。
+
+## Execution Report Requirement
+
+完成后新增：`docs/execution_reports/RLCD-004.2.md`
+至少包含：诊断结论（命令在哪层丢失）、修改总结、文件列表、ACK 协议、重发策略、编译结果、烧录结果、实机测试结果、已知问题、commit hash。
+
+## Git checkpoint
+
+1. `git diff` 检查
+2. commit：`chore: issue RLCD-004.2 page command delivery reliability`
+3. push 到 `workbuddy-development`
+
+完成后停止，等待审核。

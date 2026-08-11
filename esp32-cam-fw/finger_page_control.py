@@ -17,6 +17,12 @@
       窗口内的个别噪点帧；触发后清空窗口并进入 cooldown（默认 1.5s）冷却，避免快速跳页。
       同一页面不重复发送。
 
+投递可靠性（RLCD-004.2 改进）：M1 发出 PAGE 命令后**不再**乐观地认为已切页。
+      RLCD 收到命令即经 USB-CDC 回 ``ACK:PAGE:X``，桥接转发给本程序；只有收到对应
+      ACK 才更新权威当前页 confirmed_page，"Already current" 仅基于 confirmed_page。
+      未在 ack_timeout（默认 1.2s）内收到 ACK 则自动重发，最多 max_attempts（默认 3）
+      次，仍无 ACK 记 ``PAGE ACK TIMEOUT``。彻底消除"命令已发送即认为已切页"的状态漂移。
+
 手指判定：只统计食指/中指/无名指/小指四指，忽略拇指——拇指自然外张
       极易把"2"读成"3"。伸直判据用「指尖到腕距 > 近节指关节到腕距」，
       不依赖手的朝向，比常见的 y 坐标比较更耐旋转。
@@ -33,8 +39,10 @@
 import argparse
 import math
 import os
+import queue
 import socket
 import sys
+import threading
 import time
 import urllib.request
 from collections import deque
@@ -132,20 +140,33 @@ def count_fingers(lm):
 
 # ---------------------------------------------------------------- hub 客户端
 class HubClient:
-    """连接 camusb_bridge 的本地 hub：收帧 / 回传命令。"""
+    """连接 camusb_bridge 的本地 hub：收帧 / 回传命令 / 收 RLCD 回执(ACK)。
+
+    RLCD-004.2：hub 在同一 TCP 流里既发二进制 JPEG 帧，又发文本行 ``ACK:PAGE:X``。
+    这里用一条后台 recv 线程做解复用——缓冲以帧头(HEAD)开头就当帧，否则按
+    ``\\n`` 切出文本行、挑出 ACK 入 ack_queue——避免阻塞在主循环里漏收 ACK。
+    """
 
     def __init__(self):
         self.sock = None
         self.buf = bytearray()
+        self.frame_q = queue.Queue(maxsize=1)    # 只留最新一帧
+        self.ack_queue = queue.Queue()           # RLCD 回执 ACK:PAGE:X
+        self._recv = None
+        self._closed = False
 
     def connect(self):
         s = socket.create_connection((HUB_HOST, HUB_PORT), timeout=5)
-        s.settimeout(5)
+        s.settimeout(1.0)
         self.sock = s
         self.buf.clear()
+        self._closed = False
+        self._recv = threading.Thread(target=self._recv_loop, daemon=True)
+        self._recv.start()
         log(f"connected to hub {HUB_HOST}:{HUB_PORT}")
 
     def close(self):
+        self._closed = True
         try:
             if self.sock:
                 self.sock.close()
@@ -156,29 +177,67 @@ class HubClient:
     def send_cmd(self, cmd):
         self.sock.sendall(cmd.encode("ascii") + b"\n")
 
-    def read_frame(self):
-        """阻塞读一帧 JPEG（已按帧协议解包并校验 CRC）。"""
+    def _recv_loop(self):
+        while not self._closed:
+            try:
+                chunk = self.sock.recv(65536)
+            except socket.timeout:
+                continue                    # 无数据：继续等，绝不退出（曾误杀 recv 线程）
+            except OSError:
+                self._closed = True
+                return
+            if not chunk:
+                self._closed = True
+                return
+            self.buf.extend(chunk)
+            self._demux()
+
+    def _demux(self):
         while True:
-            idx = self.buf.find(HEAD)
-            if idx >= 0 and len(self.buf) >= idx + 6:
-                flen = (self.buf[idx + 4] << 8) | self.buf[idx + 5]
-                if 0 < flen <= 100000 and len(self.buf) >= idx + 8 + flen:
-                    frame = bytes(self.buf[idx + 6:idx + 6 + flen])
-                    crc_r = (self.buf[idx + 6 + flen] << 8) | self.buf[idx + 7 + flen]
+            if self.buf.startswith(HEAD) and len(self.buf) >= 8:
+                flen = (self.buf[4] << 8) | self.buf[5]
+                if 0 < flen <= 100000 and len(self.buf) >= 8 + flen:
+                    frame = bytes(self.buf[6:6 + flen])
+                    crc_r = (self.buf[6 + flen] << 8) | self.buf[7 + flen]
                     crc_c = flen & 0xFFFF
                     for b in frame:
                         crc_c = (crc_c + b) & 0xFFFF
-                    del self.buf[:idx + 8 + flen]
+                    del self.buf[:8 + flen]
                     if crc_c == crc_r:
-                        return frame
+                        try:
+                            self.frame_q.put_nowait(frame)
+                        except queue.Full:
+                            try:
+                                self.frame_q.get_nowait()   # 丢旧帧
+                            except queue.Empty:
+                                pass
+                            try:
+                                self.frame_q.put_nowait(frame)
+                            except queue.Full:
+                                pass
                     continue
                 if flen <= 0 or flen > 100000:
-                    del self.buf[:idx + 2]
+                    del self.buf[:2]
                     continue
-            chunk = self.sock.recv(65536)
-            if not chunk:
+                break   # 帧未收全，等更多数据
+            nl = self.buf.find(b"\n")
+            if nl >= 0:
+                line = bytes(self.buf[:nl])
+                del self.buf[:nl + 1]
+                s = line.strip().decode("ascii", "ignore")
+                if s.startswith("ACK:"):
+                    self.ack_queue.put(s)
+                continue
+            break
+
+    def read_frame(self, timeout=5):
+        """阻塞取一帧 JPEG（来自帧队列，已校验 CRC）；超时/断链抛 ConnectionError。"""
+        try:
+            return self.frame_q.get(timeout=timeout)
+        except queue.Empty:
+            if self._closed:
                 raise ConnectionError("hub closed")
-            self.buf.extend(chunk)
+            raise ConnectionError("frame timeout (hub stalled?)")
 
 
 # ---------------------------------------------------------------- 主流程
@@ -202,7 +261,8 @@ def annotate(bgr, lm, hand, fingers, cmd):
 class FingerTrigger:
     """RLCD-004.1 触发策略：滚动时间窗口 + 多数表决 + 冷却。
 
-    每帧调用 update(hand_present, fingers, now) -> (decision, cmd, diag)
+    每帧调用 update(hand_present, fingers, now, confirmed_page=None)
+      -> (decision, cmd, diag)
       decision: 'no-trigger' | 'already-there' | 'cooldown' | 'trigger'
       cmd     : decision=='trigger' 时返回要发的 PAGE 命令，否则 None
       diag    : {"counts","maj_v","maj_n","wlen"} 仅供日志/测试
@@ -211,6 +271,9 @@ class FingerTrigger:
         故在 1~2fps + 偶发抖动下也比旧的"严格连续 5 帧"容易满足。
       - 触发后立即清空窗口 -> 需重新摆出手势才再触发，天然防快速跳页。
       - cooldown 冷却期内即便多数一致也不发命令 -> 进一步防跳页/防刷屏。
+      RLCD-004.2：'already-there' 以 **confirmed_page**（RLCD 已 ACK 确认的页）
+      为准，而非"命令已发送"。confirmed_page 为 None 时退回乐观 last_sent
+      （dry-run 兼容）。这彻底消除"命令已发送即认为已切页"的状态漂移。
     """
 
     def __init__(self, min_agree=3, win_sec=3.0, cooldown=1.5):
@@ -218,10 +281,10 @@ class FingerTrigger:
         self.win_sec = win_sec
         self.cooldown = cooldown
         self.window = deque()
-        self.last_sent = None
+        self.last_sent = None          # 兼容 dry-run 的乐观回退值
         self.last_sent_t = 0.0
 
-    def update(self, hand_present, fingers, now):
+    def update(self, hand_present, fingers, now, confirmed_page=None):
         if hand_present and fingers in PAGE_CMD:
             self.window.append((fingers, now))
         while self.window and now - self.window[0][1] > self.win_sec:
@@ -235,20 +298,25 @@ class FingerTrigger:
                         if tally else (None, 0))
         wlen = len(self.window)
 
-        enough = wlen >= self.min_agree and maj_n >= self.min_agree and maj_v is not None
-        same_page = enough and PAGE_CMD[maj_v] == self.last_sent
+        diag = {"counts": counts, "maj_v": maj_v, "maj_n": maj_n, "wlen": wlen}
+        if maj_v is None:
+            return "no-trigger", None, diag
+        desired = PAGE_CMD[maj_v]
+        # 当前页：以 RLCD 已确认页为准；尚无确认时退回乐观 last_sent（dry-run）
+        cur = confirmed_page if confirmed_page is not None else self.last_sent
+        enough = wlen >= self.min_agree and maj_n >= self.min_agree
+        same_page = (desired == cur)
         cooled = (now - self.last_sent_t) >= self.cooldown
 
-        diag = {"counts": counts, "maj_v": maj_v, "maj_n": maj_n, "wlen": wlen}
-        if enough and not same_page and cooled:
-            self.last_sent = PAGE_CMD[maj_v]
-            self.last_sent_t = now
-            self.window.clear()
-            return "trigger", self.last_sent, diag
         if enough and same_page:
             return "already-there", None, diag
         if enough and not cooled:
             return "cooldown", None, diag
+        if enough and not same_page and cooled:
+            self.last_sent = desired           # 仅 dry-run 回退用
+            self.last_sent_t = now
+            self.window.clear()
+            return "trigger", desired, diag
         return "no-trigger", None, diag
 
 
@@ -262,6 +330,13 @@ def main():
                     help="发送命令后冷却秒数，防快速跳页（默认 1.5）")
     ap.add_argument("--consec", type=int, default=None,
                     help="(兼容旧参数) 等同 --min-agree")
+    ap.add_argument("--ack-timeout", type=float, default=1.2,
+                    help="RLCD-004.2：发出 PAGE 后等待 ACK 的超时秒数，超时自动重发"
+                         "（默认 1.2：实测链路含 RLCD 端 JPEG 解码，往返常达 0.6~1.5s，"
+                         "0.9 偏紧；1.2 与任务建议 0.8~1.0 同量级且更稳）")
+    ap.add_argument("--max-attempts", type=int, default=3,
+                    help="RLCD-004.2：单条命令最多发送次数（含首次），超过未收到 ACK "
+                         "则记 PAGE ACK TIMEOUT（默认 3）")
     ap.add_argument("--dry-run", action="store_true", help="只识别，不发命令")
     ap.add_argument("--show", action="store_true", help="打开 OpenCV 调试窗口")
     ap.add_argument("--save-dir", default=None, help="另存带标注的调试图到该目录")
@@ -279,13 +354,24 @@ def main():
         min_agree = 1
     win_sec = args.win_sec
     cooldown = args.cooldown
-    log(f"mediapipe backend = {det.mode}, min_agree={min_agree}, "
-        f"win_sec={win_sec}, cooldown={cooldown}, dry_run={args.dry_run}")
 
     hub = HubClient()
     trig = FingerTrigger(min_agree, win_sec, cooldown)
+
+    # ---- RLCD-004.2：命令投递可靠性状态 ----
+    # confirmed_page：RLCD 已 ACK 确认的页（权威"当前页"），None = 尚未确认过
+    # pending：已发送、等待 ACK 的命令 {cmd, sent_t, attempts}
+    # 只有收到对应 ACK，confirmed_page 才会更新；"Already current" 仅基于 confirmed_page
+    confirmed_page = None
+    pending = None
+    ACK_TIMEOUT = args.ack_timeout     # 未收到 ACK 的重发间隔（秒）
+    MAX_ATTEMPTS = args.max_attempts   # 最多发送次数（含首发的 1 次）
+
     frames = 0
     t0 = time.time()
+    log(f"mediapipe backend = {det.mode}, min_agree={min_agree}, "
+        f"win_sec={win_sec}, cooldown={cooldown}, ack_timeout={ACK_TIMEOUT}, "
+        f"max_attempts={MAX_ATTEMPTS}, dry_run={args.dry_run}")
 
     while True:
         try:
@@ -308,27 +394,58 @@ def main():
         fingers = count_fingers(lm) if lm else 0
         hand = "YES" if lm else "NO"
 
+        # ---- 先消费 RLCD 回执（ACK），更新权威当前页 ----
+        while not hub.ack_queue.empty():
+            ack = hub.ack_queue.get_nowait()
+            if not ack.startswith("ACK:"):
+                continue
+            page = ack[4:]                      # "ACK:PAGE:MEETING" -> "PAGE:MEETING"
+            if page not in PAGE_CMD.values():
+                continue
+            if pending is not None and pending["cmd"] == page:
+                confirmed_page = page
+                log(f"ACK: {ack} | CONFIRMED <- {page} (was pending)")
+                pending = None
+            elif confirmed_page != page:
+                confirmed_page = page
+                log(f"ACK: {ack} | CONFIRMED <- {page} (late / no pending)")
+            else:
+                log(f"ACK: {ack} (duplicate)")
+
         # ---- 触发决策（委托 FingerTrigger：滚动窗口多数表决 + 冷却）----
-        decision, cmd, diag = trig.update(lm is not None, fingers, now)
+        # confirmed_page 作为"当前页"权威输入，杜绝乐观状态漂移
+        decision, cmd, diag = trig.update(lm is not None, fingers, now, confirmed_page)
         counts, maj_v, maj_n, wlen = (diag["counts"], diag["maj_v"],
                                       diag["maj_n"], diag["wlen"])
 
         if decision == "trigger":
             cmd_text = cmd
-            if not args.dry_run:
-                try:
-                    hub.send_cmd(cmd)
-                except OSError as e:
-                    log(f"send failed: {e}")
-                    hub.close()
-                    cmd_text = f"{cmd} (send failed)"
-            if args.dry_run:
-                cmd_text += " (dry-run)"
-            log(f"TRIGGER: {cmd_text} | HAND:{hand} FINGER:{fingers if lm else '-'} "
-                f"WIN:{counts} MAJ:{maj_v}({maj_n}/{wlen})")
+            if pending is not None and pending["cmd"] == cmd:
+                # 上一条同页命令仍在等 ACK，交给定时重发，不要重复刷
+                log(f"AWAIT-ACK: {cmd} (pending, retry handles resend) | "
+                    f"HAND:{hand} FINGER:{fingers if lm else '-'} "
+                    f"WIN:{counts} MAJ:{maj_v}({maj_n}/{wlen})")
+            else:
+                if pending is not None:
+                    log(f"CANCEL pending {pending['cmd']} -> new {cmd}")
+                    pending = None
+                if not args.dry_run:
+                    try:
+                        hub.send_cmd(cmd)
+                        pending = {"cmd": cmd, "sent_t": now, "attempts": 1}
+                        log(f"SEND: {cmd} (attempt 1) | HAND:{hand} "
+                            f"FINGER:{fingers if lm else '-'} "
+                            f"WIN:{counts} MAJ:{maj_v}({maj_n}/{wlen})")
+                    except OSError as e:
+                        log(f"send failed: {e}")
+                        hub.close()
+                else:
+                    log(f"TRIGGER(dry-run): {cmd} | HAND:{hand} "
+                        f"FINGER:{fingers if lm else '-'} "
+                        f"WIN:{counts} MAJ:{maj_v}({maj_n}/{wlen})")
         elif decision == "already-there":
-            log(f"SKIP: {PAGE_CMD[maj_v]} already current | HAND:{hand} "
-                f"WIN:{counts} MAJ:{maj_v}({maj_n}/{wlen})")
+            log(f"SKIP: {PAGE_CMD[maj_v]} already current (confirmed={confirmed_page}) | "
+                f"HAND:{hand} WIN:{counts} MAJ:{maj_v}({maj_n}/{wlen})")
         elif decision == "cooldown":
             wait = cooldown - (now - trig.last_sent_t)
             log(f"COOLDOWN: hold {PAGE_CMD[maj_v]} | HAND:{hand} "
@@ -336,6 +453,29 @@ def main():
         else:
             log(f"HAND:{hand} FINGER:{fingers if lm else '-'} "
                 f"WIN:{counts} MAJ:{maj_v}({maj_n}/{wlen}) -> no trigger")
+
+        # ---- RLCD-004.2：ACK 超时自动重发（最多 MAX_ATTEMPTS 次）----
+        if pending is not None:
+            age = now - pending["sent_t"]
+            if age >= ACK_TIMEOUT and pending["attempts"] < MAX_ATTEMPTS:
+                if not args.dry_run:
+                    try:
+                        hub.send_cmd(pending["cmd"])
+                        pending["sent_t"] = now
+                        pending["attempts"] += 1
+                        log(f"RESEND: {pending['cmd']} (attempt {pending['attempts']})")
+                    except OSError as e:
+                        log(f"resend failed: {e}")
+                        hub.close()
+                else:
+                    pending["sent_t"] = now
+                    pending["attempts"] += 1
+                    log(f"RESEND(dry-run): {pending['cmd']} "
+                        f"(attempt {pending['attempts']})")
+            elif pending["attempts"] >= MAX_ATTEMPTS and age >= ACK_TIMEOUT:
+                log(f"PAGE ACK TIMEOUT: {pending['cmd']} "
+                    f"({MAX_ATTEMPTS} attempts, no ACK)")
+                pending = None
 
         if args.save_dir and frames % args.save_every == 0:
             out = annotate(bgr, lm, hand, fingers if lm else "-", decision)
