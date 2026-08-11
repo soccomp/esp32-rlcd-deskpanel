@@ -42,3 +42,9 @@ bool cam_client_has_frame(void);
 /* 新鲜度：最近一次成功解码发布距今 < FRESH_MS 且曾成功过。
  * 返回 false = 帧已陈旧/离线（画面可保留，但状态必须显示 stale/offline）。 */
 bool cam_client_is_fresh(void);
+
+/* RLCD-004：取走一条待处理的页面切换命令（USB-CDC 通道收到的 "PAGE:xxx"）。
+ * 返回 0=首页 1=会议页 2=吉他页，无待处理命令返回 -1；取走即清空。
+ * 由 loop() 轮询调用，并在 Lvgl_lock 保护下执行 ui_goto_page()——
+ * 解析发生在 cam_task，绝不在该任务内直接操作 LVGL 对象。 */
+int8_t cam_client_take_page_cmd(void);

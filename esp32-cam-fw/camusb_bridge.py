@@ -5,6 +5,13 @@
   ESP32-CAM (UART0, CH340, 1M) --USB扩展坞--> M1 本脚本 --> RLCD (USB-CDC 115200)
 帧协议（两端一致）：AA 55 5A A5 | len(2B BE) | JPEG | crc16(2B BE, len+data 累加)
 
+RLCD-004 新增「本地 hub」（127.0.0.1:8770）：两个串口只能被一个进程独占，
+因此手势识别程序不直接开串口，而是接本 hub：
+  hub -> 客户端：每帧原样下发（同一套帧协议，客户端可复用解析器）
+  客户端 -> hub：ASCII 命令行（白名单 PAGE:HOME|PAGE:MEETING|PAGE:GUITAR），
+                 由本脚本写入 RLCD USB-CDC，与视频帧共用同一条通道。
+视频转发逻辑、帧协议、CRC 均未改动；无客户端连接时行为与改造前完全一致。
+
 用法：
   python3 camusb_bridge.py                      # 两端口都自动发现（launchd 常驻用这个）
   python3 camusb_bridge.py <摄像头串口> <RLCD串口>   # 手动指定
@@ -18,7 +25,10 @@
 插回即自动恢复转发。配合 launchd KeepAlive 使用（见 docs/OPERATIONS.md）。
 """
 import glob
+import queue
+import socket
 import sys
+import threading
 import time
 
 import serial
@@ -33,6 +43,9 @@ ESPRESSIF_VID = 0x303A                  # ESP32-S3 原生 USB-CDC
 
 RETRY_WAIT = 3.0        # 端口缺失/异常后的重试间隔（秒）
 REPORT_EVERY = 5.0      # 帧率日志间隔（秒）
+
+HUB_HOST, HUB_PORT = "127.0.0.1", 8770  # 本地帧分流 / 命令回注
+ALLOWED_CMDS = ("PAGE:HOME", "PAGE:MEETING", "PAGE:GUITAR")
 
 
 def log(msg):
@@ -66,7 +79,102 @@ def resolve_ports(cam_arg, rlcd_arg):
     return cam, rlcd
 
 
-def pump(cam, rlcd):
+class FrameHub:
+    """本地 TCP hub：向订阅者广播帧，并收集订阅者回传的命令。
+
+    每个客户端只保留「最新一帧」（满则丢旧），慢客户端不会拖慢转发主循环。
+    命令走独立队列，由主循环统一写串口，避免多线程同时写 RLCD。
+    """
+
+    def __init__(self):
+        self._clients = []                  # [(sock, deque-like Queue(1))]
+        self._lock = threading.Lock()
+        self.commands = queue.Queue()       # 主循环消费
+
+    def start(self):
+        t = threading.Thread(target=self._serve, daemon=True)
+        t.start()
+
+    def _serve(self):
+        try:
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            srv.bind((HUB_HOST, HUB_PORT))
+            srv.listen(4)
+        except OSError as e:
+            log(f"hub disabled: {e}")        # 端口被占用不影响视频转发
+            return
+        log(f"hub listening on {HUB_HOST}:{HUB_PORT}")
+        while True:
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            q = queue.Queue(maxsize=1)
+            with self._lock:
+                self._clients.append((conn, q))
+            log(f"hub client connected ({len(self._clients)} total)")
+            threading.Thread(target=self._send_loop, args=(conn, q), daemon=True).start()
+            threading.Thread(target=self._recv_loop, args=(conn, q), daemon=True).start()
+
+    def _drop(self, conn, q):
+        with self._lock:
+            self._clients = [c for c in self._clients if c[1] is not q]
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+    def _send_loop(self, conn, q):
+        while True:
+            packet = q.get()
+            if packet is None:
+                return
+            try:
+                conn.sendall(packet)
+            except OSError:
+                self._drop(conn, q)
+                log("hub client disconnected (send)")
+                return
+
+    def _recv_loop(self, conn, q):
+        buf = b""
+        while True:
+            try:
+                chunk = conn.recv(256)
+            except OSError:
+                chunk = b""
+            if not chunk:
+                self._drop(conn, q)
+                q.put(None)
+                log("hub client disconnected (recv)")
+                return
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                cmd = line.strip().decode("ascii", "ignore").upper()
+                if cmd in ALLOWED_CMDS:
+                    self.commands.put(cmd)
+                elif cmd:
+                    log(f"hub rejected command: {cmd!r}")
+
+    def publish(self, packet):
+        with self._lock:
+            clients = list(self._clients)
+        for _, q in clients:
+            if q.full():                    # 慢客户端只丢旧帧，不阻塞主循环
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    pass
+            try:
+                q.put_nowait(packet)
+            except queue.Full:
+                pass
+
+
+def pump(cam, rlcd, hub):
     """一次连接内的转发循环；串口异常时抛出，由外层重连。"""
     buf = bytearray()
     ok = bad = 0
@@ -103,11 +211,23 @@ def pump(cam, rlcd):
             del buf[:need]
 
             if crc_c == crc_r:
-                rlcd.write(HEAD + flen.to_bytes(2, "big") + frame + crc_r.to_bytes(2, "big"))
+                packet = HEAD + flen.to_bytes(2, "big") + frame + crc_r.to_bytes(2, "big")
+                rlcd.write(packet)
                 rlcd.flush()
+                hub.publish(packet)
                 ok += 1
             else:
                 bad += 1
+
+        # 订阅者回传的页面命令：与视频帧共用 USB-CDC，写在帧边界之间
+        while True:
+            try:
+                cmd = hub.commands.get_nowait()
+            except queue.Empty:
+                break
+            rlcd.write(cmd.encode("ascii") + b"\n")
+            rlcd.flush()
+            log(f"cmd -> RLCD: {cmd}")
 
         now = time.time()
         if now - last_report >= REPORT_EVERY:
@@ -120,6 +240,9 @@ def main():
     cam_arg = sys.argv[1] if len(sys.argv) > 1 else None
     rlcd_arg = sys.argv[2] if len(sys.argv) > 2 else None
     waiting_logged = False
+
+    hub = FrameHub()
+    hub.start()
 
     while True:
         cam = rlcd = None
@@ -145,7 +268,7 @@ def main():
             rlcd.reset_output_buffer()
 
             log(f"{cam_port}@{CAM_BAUD} -> {rlcd_port}@{RLCD_BAUD}")
-            pump(cam, rlcd)
+            pump(cam, rlcd, hub)
 
         except KeyboardInterrupt:
             log("stopped")

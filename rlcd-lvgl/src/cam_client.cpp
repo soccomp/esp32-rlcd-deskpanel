@@ -46,6 +46,44 @@ bool      g_ready = false;
 volatile uint32_t g_last_sum = 0;    /* 最近发布帧的简单 checksum（字节和） */
 volatile uint32_t g_diag_cnt = 0;    /* 发布计数（每 N 帧打印一次） */
 
+#ifdef CAM_USB_INPUT
+/* ---- RLCD-004：USB-CDC 文本命令（与视频帧复用同一条 CDC 通道） ----
+ * M1 手势识别程序经桥接下发 ASCII 行："PAGE:HOME\n" / "PAGE:MEETING\n" / "PAGE:GUITAR\n"。
+ * 采集时机：只在帧头搜索态（S_H0）喂字节，JPEG 载荷在 S_BODY 消费，不会被误解析。
+ * 抗噪：只接受 [A-Z:_] 字符，遇到任何其它字节立即清空累积，随机二进制拼不出完整命令。
+ * 线程：本解析跑在 cam_task（非 LVGL 任务），只登记请求；实际切页由 loop()
+ *       在 Lvgl_lock 保护下执行（项目约束：非 LVGL 任务不得直接动 LVGL 对象）。 */
+constexpr uint8_t CMD_MAX = 16;
+char     g_cmd_buf[CMD_MAX + 1];
+uint8_t  g_cmd_len = 0;
+volatile int8_t g_page_req = -1;      /* -1 = 无待处理请求 */
+
+void cmd_feed(uint8_t c)
+{
+    if (c == '\n' || c == '\r') {
+        if (g_cmd_len > 0) {
+            g_cmd_buf[g_cmd_len] = '\0';
+            int8_t page = -1;
+            if      (strcmp(g_cmd_buf, "PAGE:HOME")    == 0) page = 0;
+            else if (strcmp(g_cmd_buf, "PAGE:MEETING") == 0) page = 1;
+            else if (strcmp(g_cmd_buf, "PAGE:GUITAR")  == 0) page = 2;
+            if (page >= 0) {
+                g_page_req = page;
+                Serial.printf("[cmd] %s -> page %d\n", g_cmd_buf, (int)page);
+            }
+            g_cmd_len = 0;
+        }
+        return;
+    }
+    if ((c >= 'A' && c <= 'Z') || c == ':' || c == '_') {
+        if (g_cmd_len < CMD_MAX) g_cmd_buf[g_cmd_len++] = (char)c;
+        else                     g_cmd_len = 0;   /* 超长 = 噪声，丢弃重来 */
+    } else {
+        g_cmd_len = 0;
+    }
+}
+#endif  /* CAM_USB_INPUT */
+
 /* ---- mDNS 解析缓存（照 ui_schedule.cpp 模式） ---- */
 String    g_url;
 bool      g_mdns_ok = false;
@@ -283,7 +321,10 @@ static size_t fetch_usb_frame(uint8_t *dst, size_t cap, uint32_t timeout_ms)
         while (Serial.available()) {
             uint8_t c = (uint8_t)Serial.read();
             switch (st) {
-                case S_H0: st = (c == 0xAA) ? S_H1 : S_H0; break;
+                case S_H0:
+                    if (c == 0xAA) st = S_H1;
+                    else           cmd_feed(c);   /* RLCD-004：帧间隙的 ASCII 命令 */
+                    break;
                 case S_H1: st = (c == 0x55) ? S_H2 : S_H0; break;
                 case S_H2: st = (c == 0x5A) ? S_H3 : S_H0; break;
                 case S_H3: st = (c == 0xA5) ? S_LENH : S_H0; break;
@@ -485,4 +526,15 @@ bool cam_client_is_fresh(void)
     uint32_t now = millis();
     uint32_t age = (now >= g_pub_ms) ? (now - g_pub_ms) : 0;
     return (age < 4000UL);   /* 4s 内未发布新帧 = 陈旧/离线 */
+}
+
+int8_t cam_client_take_page_cmd(void)
+{
+#ifdef CAM_USB_INPUT
+    int8_t p = g_page_req;
+    if (p >= 0) g_page_req = -1;   /* 取走即清空，同一命令只执行一次 */
+    return p;
+#else
+    return -1;                     /* WiFi 模式无 USB 命令通道 */
+#endif
 }

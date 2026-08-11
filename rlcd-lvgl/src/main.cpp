@@ -335,6 +335,20 @@ void loop()
         }
     }
 
+    /* ----- RLCD-004：USB-CDC 手势命令切页（M1 侧识别手指数量后下发 PAGE:xxx） -----
+     * 命令由 cam_task 解析并登记，这里在主循环取走执行，切页与按键走同一套
+     * Lvgl_lock + ui_goto_page 路径；已在目标页则不重复切，避免无谓刷屏。 */
+    {
+        int8_t req = cam_client_take_page_cmd();
+        if (req >= 0 && req != (int8_t)ui_get_current_page()) {
+            if (Lvgl_lock(100)) {
+                ui_goto_page((uint8_t)req);
+                Lvgl_unlock();
+                Serial.printf("[cmd] page -> %d (gesture)\n", (int)req);
+            }
+        }
+    }
+
     /* 进入页面检测：进入吉他页触发雷达扫描；进入会议页自动刷新日程 */
     {
         static uint8_t last_pg = 0xFF;
