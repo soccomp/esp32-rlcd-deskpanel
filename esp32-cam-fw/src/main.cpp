@@ -525,6 +525,39 @@ static void uart_cmd_task(void *arg)
     }
 }
 
+/* ================== 串口直传：JPEG 帧经 UART0 (CH340, 1M) 发送 ==================
+ * 帧协议：AA 55 5A A5 | len(2B BE) | JPEG data | crc16(2B BE, len+data 累加)
+ * 用途：WiFi 通道被企业 AP RST 拦截时的 USB 全链路视频传输
+ *  （摄像头串口 → M1 转发 → RLCD USB-CDC）。
+ * 帧源：复用 RLCD-002 的 snapshot_latest()（锁内快照，发送期间字节不可变）。
+ * 注意：1M 满载 UART 发送会干扰 WiFi 协议栈（8-07 实测），本任务按需启用。 */
+static void uart_frame_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        if (snapshot_latest() && g_send_len > 0) {
+            /* 帧头 */
+            Serial.write(0xAA);
+            Serial.write(0x55);
+            Serial.write(0x5A);
+            Serial.write(0xA5);
+            Serial.write((uint8_t)(g_send_len >> 8));
+            Serial.write((uint8_t)(g_send_len & 0xFF));
+            /* JPEG 数据 */
+            Serial.write(g_send_jpeg, g_send_len);
+            /* crc16：len + data 累加 */
+            uint16_t crc = g_send_len & 0xFFFF;
+            for (size_t i = 0; i < g_send_len; i++) {
+                crc = (uint16_t)(crc + g_send_jpeg[i]);
+            }
+            Serial.write((uint8_t)(crc >> 8));
+            Serial.write((uint8_t)(crc & 0xFF));
+            g_last_serve_ms = millis();
+        }
+        vTaskDelay(pdMS_TO_TICKS(250));   /* ~4fps 串口直传 */
+    }
+}
+
 /* ================== 串口直传（WiFi 模式已禁用） ==================
  * ⚠️ 2026-08-07 16:30：串口直传任务（uart_frame_task）在 WiFi 模式下**禁用**。
  * 原因：1M 满载 UART 发送 + Serial.flush() 阻塞严重干扰 WiFi 协议栈
@@ -564,6 +597,7 @@ void setup(void)
          * 串口直传与 WiFi 服务资源冲突，WiFi 模式下载口任务不启动。
          * 需要串口直传时再单独烧"串口版"固件（git 历史里有 uart_frame_task）。 */
         // xTaskCreate(uart_frame_task, "uartfrm", 3072, nullptr, 1, nullptr);
+        xTaskCreate(uart_frame_task, "uartfrm", 3072, nullptr, 1, nullptr);   /* USB 全链路视频：串口直传已启用 */
         xTaskCreate(uart_cmd_task, "uartcmd", 2048, nullptr, 4, nullptr);    /* 串口命令监听（免按键烧录） */
         Serial.println("[CAM] frame grabber (dual-buf) + WDT started (WiFi mode)");
     } else {

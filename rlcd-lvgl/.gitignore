@@ -30,3 +30,9 @@ schedule.json.bak
 stocks_cache.json
 __pycache__/
 *.pyc
+
+# 本地预览/调试网页（含 IP / 姓名等隐私，不提交 GitHub）
+cam_viewer.html
+clock_preview.html
+home_design_v2.html
+schedule_preview.html

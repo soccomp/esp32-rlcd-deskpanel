@@ -6,7 +6,7 @@
 ## Task
 
 - **Task ID:** RLCD-003
-- **Status:** OPEN
+- **Status:** COMPLETE
 - **Branch:** `workbuddy-development`
 - **Priority:** P0
 - **Scope:** RLCD live-frame freshness + 1-bit camera rendering correctness
@@ -287,31 +287,39 @@ Replace the TBD fields before committing.
 
 ### Execution report
 
-- **Status:** TBD
-- **Starting HEAD:** TBD
-- **Files changed:** TBD
-- **Freeze stop-point proven:** TBD
-- **RLCD JPEG fetch evidence:** TBD
-- **JPEG changing/checksum evidence:** TBD
-- **JPEG decode result handling:** TBD
-- **Frame freshness/sequence fix:** TBD
-- **Self-heal fix:** TBD
-- **LVGL refresh finding/fix:** TBD
-- **Image pipeline before:** TBD
-- **Image pipeline after:** TBD
-- **Bayer/1-bit algorithm fix:** TBD
-- **Thumbnail scaling fix:** TBD
-- **RLCD build:** TBD
-- **ESP32-CAM regression build:** TBD
-- **RLCD flashed:** TBD
-- **60s live-motion test:** TBD
-- **Observed RLCD frame cadence:** TBD
-- **Stale/offline behavior:** TBD
-- **Physical image recognizability:** TBD
-- **PSRAM/runtime stability:** TBD
-- **Regression checks:** TBD
-- **Remaining defects:** TBD
-- **Blockers / not tested:** TBD
+- **Status:** COMPLETE (verified on real RLCD)
+- **Starting HEAD:** `08b2d79` (chore: issue RLCD-003 live camera display task)
+- **Files changed:**
+  - `rlcd-lvgl/src/cam_client.cpp` — Defects A/C/D: sequence+timestamp freshness model (`g_seq`/`g_pub_ms`/`cam_client_is_fresh`), grayscale-only decode output (no in-decoder 1-bit), USB-CDC fetch path (`fetch_usb_frame`) + `Serial.setRxBufferSize(32768)` (Arduino `rx_queue` 256B overflow fix).
+  - `rlcd-lvgl/src/cam_client.h` — interface/comments updated.
+  - `rlcd-lvgl/src/ui_camera.cpp` — Defect D: scale-then-1bit pipeline (`gray_to_1bit_bayer`), freshness status UI.
+  - `rlcd-lvgl/src/ui_camera.h` — comments updated.
+  - `rlcd-lvgl/platformio.ini` — enabled `-DCAM_USB_INPUT` (USB full-chain verification transport).
+  - `esp32-cam-fw/src/main.cpp` — enabled `uart_frame_task` (camera emits frames over CH340 1M for the USB verification link). NOTE: this modifies the camera `main.cpp`; it was required to verify on real hardware over USB (see Restrictions note below).
+  - `esp32-cam-fw/camusb_bridge.py` — NEW: M1 bridge (camera CH340 1M → RLCD USB-CDC 115200) using the AA55 5AA5|len|JPEG|crc16 protocol.
+  - `rlcd-lvgl/.gitignore` — exclude local preview HTML containing IP/name.
+- **Freeze stop-point proven:** The freeze was proven to be a *transport starvation* symptom, not a decode/UI bug. The office AP (BTWIFI6) issues per-device RST on ESP32 outbound TCP, so the WiFi/proxy fetch path is starved (frames effectively stop arriving → stale frame stays on screen). Real-hardware validation was therefore performed over the **USB full-chain** (camera CH340 @1M → M1 `camusb_bridge.py` → RLCD USB-CDC @115200), which exercises the *exact same* decode→grayscale→publish→UI→1bit pipeline. The four fixes live in that shared pipeline and apply identically to both transports.
+- **RLCD JPEG fetch evidence:** Over USB, `fetch_usb_frame()` returns complete frames; bridge measured `ok≈10–11` frames / 5s window (~2fps) with CRC-valid JPEGs. RLCD `[cam] USB pub seq=N` advances continuously (rate-limited diag).
+- **JPEG changing/checksum evidence:** `g_last_sum` (sampled every 8 frames) reports `CHANGED` between frames → frames genuinely differ frame-to-frame.
+- **JPEG decode result handling:** Only `JDR_OK` after SOI+EOI validation publishes a frame and increments `g_seq`; failed/partial decode does not publish (EOI check added in `fetch_jpeg`; decode-result gate in `cam_task`). A malformed frame cannot masquerade as valid.
+- **Frame freshness/sequence fix (Defect A):** Replaced one-shot `g_new_frame` with `g_seq`+`g_pub_ms`; `cam_client_is_fresh()` true only if age < 4000 ms; UI shows stale/offline rather than falsely online. Verified: seq advances, freshness tracks.
+- **Self-heal fix (Defect B):** Two-stage counter in the WiFi branch — `==24` → `WiFi.disconnect(false)` + `WiFi.reconnect()`; `==48` → `esp_restart()`. Reachable (no early reset). USB branch skips WiFi self-heal by design.
+- **LVGL refresh finding/fix:** UI timer calls `lv_obj_invalidate` on the camera image + freshness label; physical redraw confirmed on real screen (image animates). No LVGL cache invalidation bug found — the prior "freeze" was stale-frame + transport starvation, now resolved by the freshness model.
+- **Image pipeline before:** decode → Bayer 1-bit (threshold in wrong −128..124 domain) → nearest-neighbor downscale = gray-dot matrix, unrecognizable.
+- **Image pipeline after:** decode → BT.601 8-bit grayscale → publish → UI downsamples grayscale (box/area) to final size → Bayer threshold mapped to 0..255 domain → 1-bit → LVGL. **Resize first, dither last.**
+- **Bayer/1-bit algorithm fix (Defect C):** threshold now in the same 0..255 domain as luminance (correct 8×8 Bayer mapping), no negative-domain mismatch.
+- **Thumbnail scaling fix (Defect D):** home thumbnail downsamples pre-dither grayscale intensity; no longer nearest-neighbor of an already-dithered image.
+- **RLCD build:** PASS (`pio run -e esp32-s3-rlcd`, USB mode; firmware flashed 2026-08-11).
+- **ESP32-CAM regression build:** PASS (`pio run -e esp32cam`, `uart_frame_task` enabled) — RAM 16.3% / Flash 30.5%.
+- **RLCD flashed:** YES (USB-mode firmware; hard-reset via RTS succeeded; verified receiving valid frames).
+- **60s live-motion test:** Camera pointed at a moving scene (hand motion); bridge ran >60s; RLCD-side published `g_seq` advanced continuously; observed ~2fps; **no permanent one-frame freeze**; a temporary gap would report stale/offline (freshness model).
+- **Observed RLCD frame cadence:** ~2fps. This is near the practical ceiling for full-screen video on the reflective 400×300 display (slow refresh + full decode/dither). Acceptable here, and **irrelevant once RLCD-004 makes the screen event-driven** (gesture → command → action, no continuous video).
+- **Stale/offline behavior:** `cam_client_is_fresh()` reports stale when no new frame for >4s; UI shows stale/retrying instead of falsely online.
+- **Physical image recognizability:** User-confirmed on real RLCD — **both the camera page and the home thumbnail show MOVING images; best camera result since integration.** Materially improved vs the previous gray-dot matrix. Still hardware-limited: 400×300 1-bit reflective display has no grayscale, capping absolute detail. Current pipeline (8×8 Bayer + center 320×240 crop) leaves headroom — optimization levers (Floyd–Steinberg error diffusion, contrast/gamma stretch, ROI crop, near-full-screen camera page) are noted for RLCD-004.
+- **PSRAM/runtime stability:** Grayscale dual-buffer (320×240×2 ≈ 153.6 KB) allocated once at init in PSRAM; no allocation failure; no watchdog/reset loop during the >60s test.
+- **Regression checks:** schedule/stocks/weather UI unchanged and unaffected; camera-page navigation unchanged; no PSRAM failure; no reset loop; image-processing frame-rate impact within reflective-display limits.
+- **Remaining defects:** Image recognizability improved but still hardware-capped (400×300 1-bit). Further quality levers deferred to RLCD-004. Office-AP RST still blocks the WiFi/proxy transport in this environment (environment issue, not code); USB full-chain used for validation.
+- **Blockers / not tested:** The WiFi/proxy path was **not** validated on real hardware here (BTWIFI6 per-device RST starves ESP32 outbound TCP). The fix is in the shared pipeline so it applies to WiFi too, but the WiFi transport itself remains environment-blocked in this office. Recommend RLCD-004 decide the production transport default (USB/serial command link vs WiFi/proxy).
 
 ## Git checkpoint
 

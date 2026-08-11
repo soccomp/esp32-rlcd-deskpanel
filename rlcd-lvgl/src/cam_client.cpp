@@ -28,17 +28,23 @@ constexpr int   CAM_SRC_W = 640;
 constexpr int   CAM_SRC_H = 480;
 constexpr int   CROP_X0   = (CAM_SRC_W - CAM_W) / 2;
 constexpr int   CROP_Y0   = (CAM_SRC_H - CAM_H) / 2;
-constexpr uint32_t FRAME_INTERVAL_MS = 500;  /* ~2fps，反射屏足够 */
-constexpr uint32_t RETRY_BACKOFF_MS  = 5000; /* 连续失败后的退避间隔 */
+constexpr uint32_t FRAME_INTERVAL_MS = 1500;  /* ~0.7fps；BTWIFI6 对 ESP32 高频短连接 RST，降频提高通过率 */
+constexpr uint32_t RETRY_BACKOFF_MS  = 2000;  /* 连续失败后的退避间隔（失败多为瞬时 RST，短退避快速重试） */
 
-/* ---- 双缓冲（PSRAM，init 时分配一次，任务运行期零分配） ---- */
-uint8_t  *g_buf[2] = { nullptr, nullptr };
+/* ---- 灰度双缓冲（PSRAM，init 时分配一次，任务运行期零分配） ----
+ * RLCD-003：解码只输出 8bit 灰度强度（不在此处抖动），1-bit 转换
+ * 由 UI 侧在最终显示尺寸上完成（先缩放后抖动）。 */
+uint8_t  *g_gray[2] = { nullptr, nullptr };
 uint8_t  *g_jpeg    = nullptr;
 volatile uint8_t  g_read_idx  = 0;   /* LVGL 侧可读 */
 volatile uint8_t  g_write_idx = 1;
-volatile bool     g_new_frame = false;
 volatile uint32_t g_seq       = 0;
+volatile uint32_t g_pub_ms    = 0;   /* 最近成功发布时刻（新鲜度） */
 bool      g_ready = false;
+
+/* ---- 诊断（限速打印用） ---- */
+volatile uint32_t g_last_sum = 0;    /* 最近发布帧的简单 checksum（字节和） */
+volatile uint32_t g_diag_cnt = 0;    /* 发布计数（每 N 帧打印一次） */
 
 /* ---- mDNS 解析缓存（照 ui_schedule.cpp 模式） ---- */
 String    g_url;
@@ -46,38 +52,15 @@ bool      g_mdns_ok = false;
 uint32_t  g_mdns_ms = 0;
 bool      g_mdns_init_done = false;
 
-void set_bit(uint8_t *buf, int x, int y, bool black)
-{
-    if (x < 0 || x >= CAM_W || y < 0 || y >= CAM_H) return;
-    size_t idx = (size_t)y * CAM_W + x;
-    if (black) {
-        buf[idx >> 3] |= (uint8_t)(0x80 >> (idx & 7));
-    } else {
-        buf[idx >> 3] &= (uint8_t)~(0x80 >> (idx & 7));
-    }
-}
-
-/* Bayer 8x8 ordered dithering —— 比 4x4 颗粒细腻一倍，灰阶过渡更顺滑。
- * 流程：RGB565→8bit→BT.601 亮度→200% 对比度→与 8x8 Bayer 阈值比较。
- * 参数经 Mac PIL 模拟验证（用户选定：8x8 + 对比 200%）。 */
-static const uint8_t BAYER8[8][8] = {
-    {  0, 32,  8, 40,  2, 34, 10, 42 },
-    { 48, 16, 56, 24, 50, 18, 58, 26 },
-    { 12, 44,  4, 36, 14, 46,  6, 38 },
-    { 60, 28, 52, 20, 62, 30, 54, 22 },
-    {  3, 35, 11, 43,  1, 33,  9, 41 },
-    { 51, 19, 59, 27, 49, 17, 57, 25 },
-    { 15, 47,  7, 39, 13, 45,  5, 37 },
-    { 63, 31, 55, 23, 61, 29, 53, 21 },
-};
-
+/* 解码回调：RGB565 -> BT.601 亮度(0..255) -> 写入灰度缓冲（中央 320x240 裁剪）。
+ * RLCD-003 Defect D 修复：此处**只出灰度强度**，不做任何 1-bit 抖动——
+ * 抖动/阈值化必须由 UI 侧在最终显示尺寸上完成（先缩放后抖动）。 */
 bool tjpg_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitmap)
 {
-    uint8_t *dst = g_buf[g_write_idx];
+    uint8_t *dst = g_gray[g_write_idx];
     for (uint16_t yy = 0; yy < h; yy++) {
         int16_t gy = y + yy;
         if (gy < CROP_Y0 || gy >= CROP_Y0 + CAM_H) continue;
-        const uint8_t *bayer_row = BAYER8[(gy - CROP_Y0) & 7];
         for (uint16_t xx = 0; xx < w; xx++) {
             int16_t gx = x + xx;
             if (gx < CROP_X0 || gx >= CROP_X0 + CAM_W) continue;
@@ -89,13 +72,9 @@ bool tjpg_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitmap)
             uint16_t b8 = ( px        & 0x1F) << 3;
             /* BT.601 亮度 0..255 */
             int32_t lum = (int32_t)((r8 * 77u + g8 * 150u + b8 * 29u) >> 8);
-            /* 对比度 200%: (lum-128)*2 + 128 = lum*2 - 128 */
-            lum = lum * 2 - 128;
             if (lum < 0)   lum = 0;
             if (lum > 255) lum = 255;
-            /* 8x8 Bayer 阈值 -128..+124 */
-            int16_t thr = (int16_t)(bayer_row[(gx - CROP_X0) & 7] * 4) - 128;
-            set_bit(dst, gx - CROP_X0, gy - CROP_Y0, lum < thr);
+            dst[(size_t)(gy - CROP_Y0) * CAM_W + (gx - CROP_X0)] = (uint8_t)lum;
         }
     }
     return true;   /* 继续解码 */
@@ -281,57 +260,171 @@ size_t fetch_jpeg(const String &url)
         if (g_mdns_ok) g_mdns_ms = 0;
         return 0;
     }
+    /* RLCD-003：校验 EOI（FFD9）——只有 SOI 的半帧/损坏帧不得当作有效 JPEG */
+    if (g_jpeg[total - 2] != 0xFF || g_jpeg[total - 1] != 0xD9) {
+        Serial.printf("[cam] missing EOI (tail %02X %02X)\n", g_jpeg[total-2], g_jpeg[total-1]);
+        if (g_mdns_ok) g_mdns_ms = 0;
+        return 0;
+    }
     return total;
+}
+
+/* ★ USB-CDC 收帧：从 RLCD 的 USB 串口读取一帧 JPEG（M1 转发脚本写入）。
+ * 帧协议与摄像头串口直传一致：AA 55 5A A5 | len(2B BE) | JPEG | crc16(2B BE, len+data 累加)
+ * 状态机解析（static 保持跨调用状态）；成功返回 JPEG 长度，超时返回 0。
+ * USB-CDC 全双工：RX 收帧与 Serial.printf 日志(TX)互不干扰。 */
+static size_t fetch_usb_frame(uint8_t *dst, size_t cap, uint32_t timeout_ms)
+{
+    enum { S_H0, S_H1, S_H2, S_H3, S_LENH, S_LENL, S_BODY, S_CRCH, S_CRCL, S_DONE } st = S_H0;
+    static size_t frame_len = 0, got = 0;
+    static uint16_t crc_calc = 0;
+    uint32_t t0 = millis();
+    while (millis() - t0 < timeout_ms) {
+        while (Serial.available()) {
+            uint8_t c = (uint8_t)Serial.read();
+            switch (st) {
+                case S_H0: st = (c == 0xAA) ? S_H1 : S_H0; break;
+                case S_H1: st = (c == 0x55) ? S_H2 : S_H0; break;
+                case S_H2: st = (c == 0x5A) ? S_H3 : S_H0; break;
+                case S_H3: st = (c == 0xA5) ? S_LENH : S_H0; break;
+                case S_LENH: frame_len = ((size_t)c) << 8; st = S_LENL; break;
+                case S_LENL:
+                    frame_len |= c;
+                    if (frame_len == 0 || frame_len > cap) { st = S_H0; break; }
+                    crc_calc = (uint16_t)(frame_len & 0xFFFF);
+                    got = 0;
+                    st = S_BODY;
+                    break;
+                case S_BODY:
+                    if (got < frame_len && got < cap) dst[got++] = c;
+                    crc_calc = (uint16_t)(crc_calc + c);
+                    if (got >= frame_len) st = S_CRCH;
+                    break;
+                case S_CRCH:
+                    st = (c == (uint8_t)(crc_calc >> 8)) ? S_CRCL : S_H0;
+                    break;
+                case S_CRCL:
+                    st = (c == (uint8_t)(crc_calc & 0xFF)) ? S_DONE : S_H0;
+                    break;
+                default: st = S_H0; break;
+            }
+            if (st == S_DONE) { st = S_H0; return frame_len; }
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+    return 0;   /* 超时无完整帧 */
 }
 
 void cam_task(void *arg)
 {
     uint32_t fail_ms = 0;
-    uint32_t fail_total = 0;   /* 连续失败总次数：用于网络自愈 */
+    uint32_t fail_total = 0;   /* 连续失败总次数：用于网络自愈（不重置，两阶段各触发一次） */
     for (;;) {
         uint32_t start = millis();
 
+#ifdef CAM_USB_INPUT
+        /* USB 全链路视频模式：不依赖 WiFi，从 USB-CDC 收帧（M1 转发脚本写入） */
+        size_t len = fetch_usb_frame(g_jpeg, JPEG_BUF_SIZE, 2000);
+        if (len > 0) {
+            /* 解码 -> 灰度 -> 发布（仅解码成功且完整） */
+            memset(g_gray[g_write_idx], 0, CAM_GRAY_BYTES);
+            TJpgDec.setJpgScale(1);
+            TJpgDec.setSwapBytes(true);
+            TJpgDec.setCallback(tjpg_output);
+            JRESULT jr = TJpgDec.drawJpg(0, 0, g_jpeg, len);
+            if (jr == JDR_OK) {
+                g_read_idx  = g_write_idx;
+                g_write_idx = 1 - g_read_idx;
+                g_seq++;
+                g_pub_ms = millis();
+                g_ready = true;
+                fail_ms = 0;
+                fail_total = 0;
+                uint32_t sum = 0;
+                const uint8_t *rp = g_gray[g_read_idx];
+                for (uint32_t i = 0; i < CAM_GRAY_BYTES; i += 97) sum += rp[i];
+                bool changed = (sum != g_last_sum);
+                g_last_sum = sum;
+                if (++g_diag_cnt >= 8) {
+                    g_diag_cnt = 0;
+                    Serial.printf("[cam] USB pub seq=%u len=%u sum=%u %s\n",
+                                  (unsigned)g_seq, (unsigned)len,
+                                  (unsigned)sum, changed ? "CHANGED" : "same");
+                }
+            } else {
+                Serial.printf("[cam] USB decode failed: %d\n", (int)jr);
+                fail_ms = (fail_ms == 0) ? FRAME_INTERVAL_MS : RETRY_BACKOFF_MS;
+                fail_total++;
+            }
+        } else {
+            fail_ms = (fail_ms == 0) ? FRAME_INTERVAL_MS : RETRY_BACKOFF_MS;
+            fail_total++;
+        }
+#else
         if (WiFi.status() == WL_CONNECTED) {
             String url = resolve_cam_url();
             size_t len = fetch_jpeg(url);
             if (len > 0) {
-                /* 解码 -> 灰度化 -> 双缓冲交换 */
-                memset(g_buf[g_write_idx], 0, CAM_BYTES);
+                /* 解码 -> 灰度 -> 发布（仅在解码成功且校验通过后） */
+                memset(g_gray[g_write_idx], 0, CAM_GRAY_BYTES);
                 TJpgDec.setJpgScale(1);
                 TJpgDec.setSwapBytes(true);
                 TJpgDec.setCallback(tjpg_output);
-                TJpgDec.drawJpg(0, 0, g_jpeg, len);
+                JRESULT jr = TJpgDec.drawJpg(0, 0, g_jpeg, len);
 
-                g_read_idx  = g_write_idx;
-                g_write_idx = 1 - g_read_idx;
-                g_new_frame = true;
-                g_seq++;
-                g_ready = true;
-                fail_ms = 0;
-                fail_total = 0;
-                Serial.printf("[cam] frame %lu rendered (%u bytes)\n",
-                              (unsigned long)g_seq, (unsigned)len);
+                if (jr == JDR_OK) {
+                    g_read_idx  = g_write_idx;
+                    g_write_idx = 1 - g_read_idx;
+                    g_seq++;
+                    g_pub_ms = millis();
+                    g_ready = true;
+                    fail_ms = 0;
+                    fail_total = 0;
+
+                    /* 诊断（限速）：字节和 checksum 判断帧是否真的在变 */
+                    uint32_t sum = 0;
+                    const uint8_t *rp = g_gray[g_read_idx];
+                    for (uint32_t i = 0; i < CAM_GRAY_BYTES; i += 97) sum += rp[i];  /* 抽样省 CPU */
+                    bool changed = (sum != g_last_sum);
+                    g_last_sum = sum;
+                    if (++g_diag_cnt >= 8) {   /* 每 8 帧打印一次 */
+                        g_diag_cnt = 0;
+                        Serial.printf("[cam] pub seq=%u len=%u sum=%u %s\n",
+                                      (unsigned)g_seq, (unsigned)len,
+                                      (unsigned)sum, changed ? "CHANGED" : "same");
+                    }
+                } else {
+                    Serial.printf("[cam] decode failed: %d\n", (int)jr);
+                    fail_ms = (fail_ms == 0) ? FRAME_INTERVAL_MS : RETRY_BACKOFF_MS;
+                    fail_total++;
+                }
             } else {
                 fail_ms = (fail_ms == 0) ? FRAME_INTERVAL_MS : RETRY_BACKOFF_MS;
                 fail_total++;
             }
         }
+#endif  /* CAM_USB_INPUT */
 
-        /* ★ 网络自愈：BTWIFI6 对 ESP32 出站 TCP 做间歇性 RST，会把 lwIP
-         * TCP 栈打坏（errno 113 死循环）。连续失败超阈值后主动重启 WiFi
-         * 重新关联 AP 清栈；再不行直接重启系统（无人值守兜底）。 */
-        if (fail_total >= 24) {              /* 24 次 ≈ 2 分钟连续失败 */
-            Serial.println("[cam] self-heal: restarting WiFi (RST-stuck stack)");
-            WiFi.disconnect(true);
+#ifdef CAM_USB_INPUT
+        /* USB 全链路视频模式不依赖 WiFi：跳过 WiFi 自愈/重启逻辑 */
+        (void)fail_total;
+#else
+        /* ★ 网络自愈（RLCD-003 Defect B 修复）：BTWIFI6 对 ESP32 出站 TCP 做间歇性
+         * RST 会把 lwIP TCP 栈打坏（errno 113 死循环）。两阶段计数不重置：
+         *  - 第 24 次失败：重启 WiFi 关联（disconnect(false) 不关 radio，再 reconnect）
+         *  - 第 48 次失败（WiFi 重启仍无效）：整机重启兜底 */
+        if (fail_total == 24) {
+            Serial.println("[cam] self-heal-1: WiFi reconnect (RST-stuck stack)");
+            WiFi.disconnect(false);   /* false：不关闭 radio，reconnect 才能生效 */
             delay(200);
             WiFi.reconnect();
-            fail_total = 0;
-            g_mdns_ms = 0;                   /* 强制重新解析后端 */
-        } else if (fail_total >= 48) {       /* WiFi 重启仍无效 -> 整机重启 */
-            Serial.println("[cam] self-heal: WiFi restart failed, rebooting...");
+            g_mdns_ms = 0;            /* 强制重新解析后端 */
+        } else if (fail_total == 48) {
+            Serial.println("[cam] self-heal-2: WiFi restart failed, rebooting...");
             delay(200);
             esp_restart();
         }
+#endif  /* CAM_USB_INPUT */
 
         uint32_t elapsed = millis() - start;
         uint32_t wait = (fail_ms > 0) ? fail_ms : FRAME_INTERVAL_MS;
@@ -345,29 +438,38 @@ void cam_client_init(void)
 {
     if (g_jpeg) return;   /* 防重复初始化 */
 
-    g_buf[0] = static_cast<uint8_t *>(
-        heap_caps_malloc(CAM_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    g_buf[1] = static_cast<uint8_t *>(
-        heap_caps_malloc(CAM_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    g_gray[0] = static_cast<uint8_t *>(
+        heap_caps_malloc(CAM_GRAY_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    g_gray[1] = static_cast<uint8_t *>(
+        heap_caps_malloc(CAM_GRAY_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     g_jpeg = static_cast<uint8_t *>(
         heap_caps_malloc(JPEG_BUF_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
 
-    if (!g_buf[0] || !g_buf[1] || !g_jpeg) {
+    if (!g_gray[0] || !g_gray[1] || !g_jpeg) {
         Serial.println("[cam] PSRAM alloc failed, cam disabled");
         return;
     }
-    memset(g_buf[0], 0, CAM_BYTES);
-    memset(g_buf[1], 0, CAM_BYTES);
+    memset(g_gray[0], 0, CAM_GRAY_BYTES);
+    memset(g_gray[1], 0, CAM_GRAY_BYTES);
+
+#ifdef CAM_USB_INPUT
+    /* ★ USB 全链路模式关键：Arduino 层 USBCDC rx_queue 默认仅 256 字节，
+     * 15KB 的 JPEG 帧到达即溢出丢弃（"CDC RX Overflow"，_onRX 里 xQueueSend
+     * 失败即丢）。必须调大——setRxBufferSize 运行中调用会重建队列并保留
+     * 旧数据。TinyUSB 驱动层 64B 缓冲不用动（满了会 NAK 主机暂停传输，不丢）。 */
+    Serial.setRxBufferSize(32768);
+    Serial.println("[cam] USB input mode, CDC rx queue = 32KB");
+#endif
 
     /* 栈 8192：VGA 640x480 全尺寸解码（TJpgDec 内部 MCU 缓冲 + 裁切）需要大栈 */
     xTaskCreate(cam_task, "camfetch", 8192, nullptr, 4, nullptr);
-    Serial.println("[cam] cam_client started (2fps, QVGA mono)");
+    Serial.println("[cam] cam_client started (2fps, QVGA grayscale)");
 }
 
-bool cam_client_get_frame(uint8_t *bitmap_out, uint32_t *seq_out)
+bool cam_client_get_frame(uint8_t *gray_out, uint32_t *seq_out)
 {
-    if (!g_new_frame || !g_buf[g_read_idx] || !bitmap_out) return false;
-    memcpy(bitmap_out, g_buf[g_read_idx], CAM_BYTES);
+    if (!g_ready || !g_gray[g_read_idx] || !gray_out) return false;
+    memcpy(gray_out, g_gray[g_read_idx], CAM_GRAY_BYTES);
     if (seq_out) *seq_out = g_seq;
     return true;
 }
@@ -375,4 +477,12 @@ bool cam_client_get_frame(uint8_t *bitmap_out, uint32_t *seq_out)
 bool cam_client_has_frame(void)
 {
     return g_ready;
+}
+
+bool cam_client_is_fresh(void)
+{
+    if (!g_ready) return false;
+    uint32_t now = millis();
+    uint32_t age = (now >= g_pub_ms) ? (now - g_pub_ms) : 0;
+    return (age < 4000UL);   /* 4s 内未发布新帧 = 陈旧/离线 */
 }
