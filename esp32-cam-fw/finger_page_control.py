@@ -11,8 +11,11 @@
   2 根手指 -> PAGE:MEETING  会议页
   3 根手指 -> PAGE:GUITAR   吉他页
 
-防抖：连续 N 帧（默认 5）识别到同一手指数才发命令；同一页面不重复发送。
-      摄像头约 2fps，5 帧 ≈ 2.5s，对应"手势保持 2 秒"的验收要求。
+防抖（RLCD-004.1 改进）：用「滚动时间窗口 + 多数表决 + 冷却」替代原先的严格连续 N 帧。
+      1~2fps 下，偶发漏检/误数会让"连续 5 帧一致"几乎无法满足；新策略在最近 win_sec
+      （默认 3s）窗口内，只要 ≥min_agree（默认 3）帧认同同一手指数即触发，天然容忍
+      窗口内的个别噪点帧；触发后清空窗口并进入 cooldown（默认 1.5s）冷却，避免快速跳页。
+      同一页面不重复发送。
 
 手指判定：只统计食指/中指/无名指/小指四指，忽略拇指——拇指自然外张
       极易把"2"读成"3"。伸直判据用「指尖到腕距 > 近节指关节到腕距」，
@@ -20,9 +23,12 @@
 
 用法：
   python3 finger_page_control.py                      # 常规运行（控制台调试输出）
-  python3 finger_page_control.py --dry-run            # 只识别不发命令（Phase 1 验证）
-  python3 finger_page_control.py --save-dir /tmp/x    # 另存带标注的调试图
+  python3 finger_page_control.py --dry-run            # 只识别不发命令
   python3 finger_page_control.py --show               # 打开 OpenCV 实时调试窗口
+  python3 finger_page_control.py --save-dir /tmp/x    # 另存带标注的调试图
+  # 触发调参（RLCD-004.1，默认即适合 1~2fps）：
+  python3 finger_page_control.py --min-agree 3 --win-sec 3.0 --cooldown 1.5
+  # 兼容旧参数：--consec 等同 --min-agree
 """
 import argparse
 import math
@@ -31,6 +37,7 @@ import socket
 import sys
 import time
 import urllib.request
+from collections import deque
 
 import cv2
 import numpy as np
@@ -191,10 +198,70 @@ def annotate(bgr, lm, hand, fingers, cmd):
     return img
 
 
+# ---------------------------------------------------------------- 触发策略
+class FingerTrigger:
+    """RLCD-004.1 触发策略：滚动时间窗口 + 多数表决 + 冷却。
+
+    每帧调用 update(hand_present, fingers, now) -> (decision, cmd, diag)
+      decision: 'no-trigger' | 'already-there' | 'cooldown' | 'trigger'
+      cmd     : decision=='trigger' 时返回要发的 PAGE 命令，否则 None
+      diag    : {"counts","maj_v","maj_n","wlen"} 仅供日志/测试
+    设计要点（对应任务要求：提高成功率、不降稳定性、不快速跳页）：
+      - 窗口只收 1/2/3；逐帧漏检/误数不再清零整个连击，只需窗口内多数一致，
+        故在 1~2fps + 偶发抖动下也比旧的"严格连续 5 帧"容易满足。
+      - 触发后立即清空窗口 -> 需重新摆出手势才再触发，天然防快速跳页。
+      - cooldown 冷却期内即便多数一致也不发命令 -> 进一步防跳页/防刷屏。
+    """
+
+    def __init__(self, min_agree=3, win_sec=3.0, cooldown=1.5):
+        self.min_agree = min_agree
+        self.win_sec = win_sec
+        self.cooldown = cooldown
+        self.window = deque()
+        self.last_sent = None
+        self.last_sent_t = 0.0
+
+    def update(self, hand_present, fingers, now):
+        if hand_present and fingers in PAGE_CMD:
+            self.window.append((fingers, now))
+        while self.window and now - self.window[0][1] > self.win_sec:
+            self.window.popleft()
+
+        counts = [c for c, _ in self.window]
+        tally = {}
+        for c in counts:
+            tally[c] = tally.get(c, 0) + 1
+        maj_v, maj_n = (max(tally.items(), key=lambda kv: kv[1])
+                        if tally else (None, 0))
+        wlen = len(self.window)
+
+        enough = wlen >= self.min_agree and maj_n >= self.min_agree and maj_v is not None
+        same_page = enough and PAGE_CMD[maj_v] == self.last_sent
+        cooled = (now - self.last_sent_t) >= self.cooldown
+
+        diag = {"counts": counts, "maj_v": maj_v, "maj_n": maj_n, "wlen": wlen}
+        if enough and not same_page and cooled:
+            self.last_sent = PAGE_CMD[maj_v]
+            self.last_sent_t = now
+            self.window.clear()
+            return "trigger", self.last_sent, diag
+        if enough and same_page:
+            return "already-there", None, diag
+        if enough and not cooled:
+            return "cooldown", None, diag
+        return "no-trigger", None, diag
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--consec", type=int, default=5,
-                    help="连续多少帧识别一致才发命令（默认 5）")
+    ap.add_argument("--min-agree", type=int, default=3,
+                    help="滚动窗口内至少多少帧认同同一手指数才发命令（默认 3）")
+    ap.add_argument("--win-sec", type=float, default=3.0,
+                    help="滚动时间窗口长度秒（默认 3.0）")
+    ap.add_argument("--cooldown", type=float, default=1.5,
+                    help="发送命令后冷却秒数，防快速跳页（默认 1.5）")
+    ap.add_argument("--consec", type=int, default=None,
+                    help="(兼容旧参数) 等同 --min-agree")
     ap.add_argument("--dry-run", action="store_true", help="只识别，不发命令")
     ap.add_argument("--show", action="store_true", help="打开 OpenCV 调试窗口")
     ap.add_argument("--save-dir", default=None, help="另存带标注的调试图到该目录")
@@ -206,11 +273,17 @@ def main():
         os.makedirs(args.save_dir, exist_ok=True)
 
     det = HandDetector()
-    log(f"mediapipe backend = {det.mode}, consec={args.consec}, dry_run={args.dry_run}")
+    # ---- 触发参数（RLCD-004.1：滚动窗口多数表决 + 冷却）----
+    min_agree = args.min_agree if args.consec is None else args.consec
+    if min_agree < 1:
+        min_agree = 1
+    win_sec = args.win_sec
+    cooldown = args.cooldown
+    log(f"mediapipe backend = {det.mode}, min_agree={min_agree}, "
+        f"win_sec={win_sec}, cooldown={cooldown}, dry_run={args.dry_run}")
 
     hub = HubClient()
-    streak_val, streak_n = -1, 0
-    last_sent = None
+    trig = FingerTrigger(min_agree, win_sec, cooldown)
     frames = 0
     t0 = time.time()
 
@@ -229,47 +302,47 @@ def main():
         if bgr is None:
             continue
         frames += 1
+        now = time.time()
 
         lm = det.detect(bgr)
         fingers = count_fingers(lm) if lm else 0
         hand = "YES" if lm else "NO"
-        cmd_text = "-"
 
-        # 防抖：只有 1/2/3 参与计数，其它（无手/0/4 指）打断连续性
-        if lm and fingers in PAGE_CMD:
-            if fingers == streak_val:
-                streak_n += 1
-            else:
-                streak_val, streak_n = fingers, 1
-        else:
-            streak_val, streak_n = -1, 0
+        # ---- 触发决策（委托 FingerTrigger：滚动窗口多数表决 + 冷却）----
+        decision, cmd, diag = trig.update(lm is not None, fingers, now)
+        counts, maj_v, maj_n, wlen = (diag["counts"], diag["maj_v"],
+                                      diag["maj_n"], diag["wlen"])
 
-        if streak_n == args.consec:
-            cmd = PAGE_CMD[streak_val]
-            if cmd == last_sent:
-                cmd_text = f"{cmd} (skip, already there)"
-            else:
-                cmd_text = cmd
-                if args.dry_run:
-                    cmd_text += " (dry-run)"
-                else:
-                    try:
-                        hub.send_cmd(cmd)
-                        last_sent = cmd
-                    except OSError as e:
-                        log(f"send failed: {e}")
-                        hub.close()
-            log(f"HAND: {hand}  FINGER: {streak_val}  CMD: {cmd_text}")
+        if decision == "trigger":
+            cmd_text = cmd
+            if not args.dry_run:
+                try:
+                    hub.send_cmd(cmd)
+                except OSError as e:
+                    log(f"send failed: {e}")
+                    hub.close()
+                    cmd_text = f"{cmd} (send failed)"
+            if args.dry_run:
+                cmd_text += " (dry-run)"
+            log(f"TRIGGER: {cmd_text} | HAND:{hand} FINGER:{fingers if lm else '-'} "
+                f"WIN:{counts} MAJ:{maj_v}({maj_n}/{wlen})")
+        elif decision == "already-there":
+            log(f"SKIP: {PAGE_CMD[maj_v]} already current | HAND:{hand} "
+                f"WIN:{counts} MAJ:{maj_v}({maj_n}/{wlen})")
+        elif decision == "cooldown":
+            wait = cooldown - (now - trig.last_sent_t)
+            log(f"COOLDOWN: hold {PAGE_CMD[maj_v]} | HAND:{hand} "
+                f"WIN:{counts} MAJ:{maj_v}({maj_n}/{wlen}) wait {wait:.1f}s")
         else:
-            log(f"HAND: {hand}  FINGER: {fingers if lm else '-'}  "
-                f"streak={streak_n}/{args.consec}")
+            log(f"HAND:{hand} FINGER:{fingers if lm else '-'} "
+                f"WIN:{counts} MAJ:{maj_v}({maj_n}/{wlen}) -> no trigger")
 
         if args.save_dir and frames % args.save_every == 0:
-            out = annotate(bgr, lm, hand, fingers if lm else "-", cmd_text)
+            out = annotate(bgr, lm, hand, fingers if lm else "-", decision)
             cv2.imwrite(os.path.join(args.save_dir, f"f{frames:04d}.jpg"), out)
         if args.show:
-            cv2.imshow("RLCD-004 finger control",
-                       annotate(bgr, lm, hand, fingers if lm else "-", cmd_text))
+            cv2.imshow("RLCD-004.1 finger control",
+                       annotate(bgr, lm, hand, fingers if lm else "-", decision))
             if cv2.waitKey(1) & 0xFF == 27:
                 break
 

@@ -225,3 +225,76 @@ RLCD 进入吉他页
 
 完成后停止，不执行开发。
 等待下一轮审核。
+
+---
+
+# RLCD-004.1 Gesture Trigger Stability Improvement
+
+## Task
+
+- **Task ID:** RLCD-004.1
+- **Status:** OPEN（WorkBuddy 执行完成，待审核）
+- **Branch:** `workbuddy-development`
+- **Priority:** P1
+- **Previous task:** RLCD-004 COMPLETE — 手指计数→页面切换原型已交付并初步人工验收（commit `ea70a56`）。
+
+---
+
+## Background（为何要做）
+
+RLCD-004 初步人工验收结论：MediaPipe 能识别手、finger count 能变化、调试窗口 HAND/FINGER/CMD 正常、RLCD 偶尔能按手指数切页；但**实际体验差**——两三分钟只成功切换 3~4 次，大部分手势没触发，摄像头帧率约 1~2fps。
+
+**根因（已分析，未改架构）**：原触发要求"连续 5 帧严格一致"才发命令。在 1~2fps 下，5 帧 ≈ 2.5~5s；而 MediaPipe 在弱光/低分辨率/手晃动时**偶发漏检（NO hand）或误数**，任意一帧不一致即把连击清零，导致几乎永远凑不满 5 帧。
+
+---
+
+## Goal
+
+在不重新设计架构、不改摄像头画质、不做复杂手势的前提下，**提高真实使用时的手势触发成功率**。
+
+---
+
+## Requirement
+
+### 1. M1 侧触发策略优化
+- 用「滚动时间窗口 + 多数表决 + 命令冷却」替代"严格连续 N 帧"。
+- 在 1~2fps 下，窗口内多数帧认同同一手指数即触发，天然容忍个别漏检/误数帧。
+- 触发后清空窗口 + 进入冷却期，避免快速跳页、避免同页重复刷屏。
+- 参数可调（默认应已适配 1~2fps）：`--min-agree`（默认 3）、`--win-sec`（默认 3.0s）、`--cooldown`（默认 1.5s）。
+- 不降低稳定性；不快速跳页；不影响视频桥接。
+
+### 2. 增加必要日志
+M1 侧每帧输出：是否检测到手、当前 finger count、是否满足触发条件（及不满足原因）、实际发送的 PAGE 命令。
+ESP32 侧确认：是否收到 PAGE 命令、是否执行页面切换（含"已在该页→不切"的 no-op 记录）。
+
+### 3. 约束（与本任务范围）
+- 不重新设计架构；不处理摄像头画质优化；不做复杂手势；不改整体架构。
+- 职责分离不变：M1 跑视觉，RLCD 只收 `PAGE:xxx` 简单命令。
+- USB 命令协议、帧协议、hub 转发机制保持不变。
+
+---
+
+## Validation
+
+- 单元/逻辑测试：用真实痛点场景（1~2fps + 漏检/误数）对比新旧触发策略，证明新策略能触发而旧策略几乎不触发；并验证冷却、同页不重发、0/4 指不触发、切页顺序正确。
+- 编译验证：固件 `pio run` 通过。
+- 实机测试：
+  - 自动可验：M1 侧新日志正常、MediaPipe 实帧无崩溃；桥接下发 PAGE 命令被正确转发、非法命令被拒。
+  - 人工手势验收（自动化环境无人手，需用户在摄像头前执行）：举 1/2/3 指保持约 2s，观察切换成功率较 RLCD-004 明显提升、无快速跳页。runbook 见执行报告。
+
+---
+
+## Execution Report Requirement
+
+完成后新增：`docs/execution_reports/RLCD-004.1.md`
+至少包含：修改总结、文件列表、根因分析、技术方案（触发策略/日志）、编译结果、烧录结果、实机测试结果、已知问题、commit hash。
+
+---
+
+## Git checkpoint
+
+1. `git diff` 检查
+2. commit：`chore: issue RLCD-004.1 gesture trigger stability improvement`
+3. push 到 `workbuddy-development`
+
+完成后停止，等待审核。

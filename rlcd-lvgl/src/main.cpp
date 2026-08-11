@@ -346,6 +346,9 @@ void loop()
                 Lvgl_unlock();
                 Serial.printf("[cmd] page -> %d (gesture)\n", (int)req);
             }
+        } else if (req >= 0) {
+            /* RLCD-004.1：收到命令但已在目标页，记录 no-op 便于排查，不重复切 */
+            Serial.printf("[cmd] page %d already current, skip (gesture)\n", (int)req);
         }
     }
 
