@@ -398,6 +398,8 @@ void rx_task(void *arg)
                 xSemaphoreGive(g_frame_sem);
             }
         }
+        /* 8-12：显式让出，防 core0 的 idle 任务被饿死触发任务看门狗(TWDT)重启 */
+        vTaskDelay(pdMS_TO_TICKS(2));
     }
 }
 #endif  /* CAM_USB_INPUT */
