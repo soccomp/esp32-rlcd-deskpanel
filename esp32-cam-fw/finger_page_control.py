@@ -330,10 +330,10 @@ def main():
                     help="发送命令后冷却秒数，防快速跳页（默认 1.5）")
     ap.add_argument("--consec", type=int, default=None,
                     help="(兼容旧参数) 等同 --min-agree")
-    ap.add_argument("--ack-timeout", type=float, default=1.2,
+    ap.add_argument("--ack-timeout", type=float, default=2.0,
                     help="RLCD-004.2：发出 PAGE 后等待 ACK 的超时秒数，超时自动重发"
-                         "（默认 1.2：实测链路含 RLCD 端 JPEG 解码，往返常达 0.6~1.5s，"
-                         "0.9 偏紧；1.2 与任务建议 0.8~1.0 同量级且更稳）")
+                         "（默认 2.0：单任务 pump 固件命令→ACK 往返含 JPEG 解码约 2~3s，"
+                         "1.2 会误超时；2.0 + 重发3次 ≈ 6s 窗口覆盖最坏链路）")
     ap.add_argument("--max-attempts", type=int, default=3,
                     help="RLCD-004.2：单条命令最多发送次数（含首次），超过未收到 ACK "
                          "则记 PAGE ACK TIMEOUT（默认 3）")
