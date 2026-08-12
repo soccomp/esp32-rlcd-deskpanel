@@ -8,8 +8,8 @@
 
 映射：
   1 根手指 -> PAGE:HOME     首页
-  2 根手指 -> PAGE:MEETING  会议页
-  3 根手指 -> PAGE:GUITAR   吉他页
+  2 根手指 -> PAGE:GUITAR   吉他页
+  3 根手指 -> PAGE:CAMERA   摄像头页
 
 防抖（RLCD-004.1 改进）：用「滚动时间窗口 + 多数表决 + 冷却」替代原先的严格连续 N 帧。
       1~2fps 下，偶发漏检/误数会让"连续 5 帧一致"几乎无法满足；新策略在最近 win_sec
@@ -53,7 +53,7 @@ import numpy as np
 HUB_HOST, HUB_PORT = "127.0.0.1", 8770
 HEAD = b"\xaa\x55\x5a\xa5"
 
-PAGE_CMD = {1: "PAGE:HOME", 2: "PAGE:MEETING", 3: "PAGE:GUITAR"}
+PAGE_CMD = {1: "PAGE:HOME", 2: "PAGE:GUITAR", 3: "PAGE:CAMERA"}
 
 MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
              "hand_landmarker/float16/1/hand_landmarker.task")
@@ -276,7 +276,7 @@ class FingerTrigger:
       （dry-run 兼容）。这彻底消除"命令已发送即认为已切页"的状态漂移。
     """
 
-    def __init__(self, min_agree=3, win_sec=3.0, cooldown=1.5):
+    def __init__(self, min_agree=3, win_sec=3.0, cooldown=2.5):
         self.min_agree = min_agree
         self.win_sec = win_sec
         self.cooldown = cooldown
@@ -326,8 +326,9 @@ def main():
                     help="滚动窗口内至少多少帧认同同一手指数才发命令（默认 3）")
     ap.add_argument("--win-sec", type=float, default=3.0,
                     help="滚动时间窗口长度秒（默认 3.0）")
-    ap.add_argument("--cooldown", type=float, default=1.5,
-                    help="发送命令后冷却秒数，防快速跳页（默认 1.5）")
+    ap.add_argument("--cooldown", type=float, default=2.5,
+                    help="发送命令后冷却秒数，防快速跳页（默认 2.5：密集切页触发 RLCD "
+                         "高负载供电复位，2.5s 冷却兼顾响应与稳定性）")
     ap.add_argument("--consec", type=int, default=None,
                     help="(兼容旧参数) 等同 --min-agree")
     ap.add_argument("--ack-timeout", type=float, default=2.0,

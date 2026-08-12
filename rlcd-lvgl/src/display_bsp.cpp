@@ -351,6 +351,11 @@ void DisplayPort::InitLandscapeLUT() {
 }
 
 void DisplayPort::RLCD_SetPixel(uint16_t x, uint16_t y, uint8_t color) {
+  /* 8-13 审核修复：查表法版本原无边界检查。LVGL full_refresh 异常时可能给出
+   * 越界 area（x>=width_ 或 y>=height_），会读 LUT 越界得垃圾 idx 再写
+   * DispBuffer 越界 -> heap corruption -> 后续 LVGL 刷新 LoadProhibited 崩溃。
+   * 与 SetPortraitPixel/SetLandscapePixel 版本保持一致：越界直接忽略。 */
+  if (x >= width_ || y >= height_) return;
   uint32_t idx = PixelIndexLUT[x][y];
   uint8_t mask = PixelBitLUT[x][y];
 

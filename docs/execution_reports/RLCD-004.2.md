@@ -1,10 +1,10 @@
 # RLCD-004.2 Execution Report — Page Command Delivery Reliability
 
 - **Task ID:** RLCD-004.2
-- **Status:** 实机验证基本完成（最终稳定性固件烧录待 USB 物理恢复后补验）
+- **Status:** 实机验证完成（含 ChatGPT 代码级审核修正，8-12 定案）
 - **Branch:** `workbuddy-development`
 - **Commit:** 见文末（推送后回填）
-- **Date:** 2026-08-11
+- **Date:** 2026-08-11（首次） / 2026-08-12（审核修正定案）
 
 ---
 
@@ -181,3 +181,62 @@ cd /Users/m1work/Projects/ESP32S3-RLCD/esp32-cam-fw
 - 提交信息：`chore: issue RLCD-004.2 page command delivery reliability`
 - 推送目标：`origin/workbuddy-development`
 - Commit hash：推送后回填
+
+---
+
+## 9. ChatGPT 代码级审核修正（2026-08-12）
+
+审核提出两个 blocking issue，均已修复并实机验证。
+
+### Issue 1：ACK 时机错误（假 ACK）
+
+**问题**：原 `cmd_feed` 解析到 `PAGE:X` 立即回 `ACK:PAGE:X`，只证明"命令被解析"；
+若 `Lvgl_lock` 失败或切页未生效，M1 已收到 ACK 会错误更新 confirmed_page。
+
+**修复**（ACK 语义 = "实际页面状态已确认"）：
+- `cmd_feed` 只登记 `g_page_req`，**不打印 ACK**（同时为消除 CDC 三方并发，连解析日志也移到 main）。
+- `main.cpp` 切页块：取走请求后
+  - 已在目标页 → 直接 `cam_client_send_ack(req)`；
+  - `Lvgl_lock(1000)` 成功 → `ui_goto_page` → **校验 `ui_get_current_page()==目标页` 才 ACK**；未生效打印 FAILED、不 ACK；
+  - `Lvgl_lock` 失败 → 打印 `no ACK`、**不 ACK**（M1 超时自动重发）。
+- 新增 `cam_client_send_ack(int8_t page)`（cam_client.h/.cpp）。
+
+**验证**：注入 30 次，逐条核对 bridge 日志——**每条 `ACK ACK:PAGE:X` 都紧跟
+`rlcd: [cmd] page -> N (gesture)`（实际切页）**，无一条 ACK 出现在切页失败/锁失败之后。
+
+### Issue 2：PSRAM ring slot 生命周期竞争
+
+**问题**：原实现 `cam_task` 在 `xSemaphoreTake` 后立即推进 `ring_r`，解码未完成时
+`rx_task` 可能认为旧 slot 空闲并写入 → decode 时被覆盖。
+
+**修复**：改用 **free_q / ready_q 双队列**实现真正的 producer/consumer slot 所有权：
+- `rx_task`：收帧到独立 `g_rx_buf` → 从 `free_q` 领取空闲 slot（空则丢帧）→ memcpy → 放 `ready_q`；
+- `cam_task`：从 `ready_q` 收 slot → 解码（**期间该 slot 不在任何队列，rx_task 不可写**）→ 解码完归还 `free_q`。
+- 不再依赖 counting semaphore 计数判断可重用。
+
+**验证**：修复后 30 分钟持续注入期间 **`decode failed = 0`**（此前双核版累计 225 次）、
+`bad` 归零级波动、seq 连续无重启。
+
+### 附加稳定性修复（实机排查发现）
+
+- **rx_task 内 printf 是周期性崩溃根因**：`cmd_feed` 的 `Serial.printf`（TX）与 cam_task/main
+  的 printf 三方并发访问 TinyUSB CDC → rx_task 卡死占满 core0 → TWDT 重启（`[cam]` 启动日志
+  周期性重现 + 命令黑洞 20~30s）。修复：**rx_task 内零 printf**（纯读 RX），日志全部由
+  main/cam_task 输出。修复后 30/30 稳定。
+- **`Lvgl_lock(100)` → `Lvgl_lock(1000)`**：反射屏全屏刷新（`full_refresh=1`）可占锁数百 ms，
+  100ms 偏短导致切页偶发失败；1s 后切页成功率显著提升（失败路径仍无假 ACK，M1 重发兜底）。
+- **Serial 全局锁（根治跨核并发崩溃）**：即使 rx_task 零 printf，其 `Serial.read()`（RX）与
+  cam_task/main 的 printf（TX）跨核并发仍偶发卡死 rx_task（30 分钟注入中 15 分钟时崩一次）。
+  修复：全局 `g_serial_lock`（mutex），`cam_client_log()` 带锁 printf + `serial_read_locked()`
+  带锁读——所有 Serial 读/写串行化。这是最终的稳定性保障。
+
+### 最终验证汇总（8-12，双核 + free/ready 队列 + rx_task 无 printf 固件）
+
+| 验证项 | 结果 |
+|---|---|
+| 30 条注入 @1.5s（多轮） | **30/30、0 超时、0 重发**（PASS） |
+| 20 条密集注入 @0.3s | **20/20、0 超时、10 次重发**（Lvgl_lock 失败 44 次累计，全部无假 ACK，M1 重发兜底） |
+| ACK 配对核对 | 每条 ACK 均配对 `[cmd] page -> N (gesture)`，无假 ACK |
+| decode corruption | **decode failed = 0**（free/ready 队列生效） |
+| 30 分钟视频+命令稳定 | **PASS**：180 条命令注入 30.2 min，decode failed=0，seq 连续无重启（11:25→11:56），测试窗口内零 link lost |
+| 真人手势 1→2→3→1 | 人工验收（runbook 见 §6） |

@@ -7,8 +7,8 @@
  *    2. 在 local_config.h 中填入你 Mac 的主机名 / 局域网 IP
  *      （该文件已被 .gitignore 忽略）
  *
- *  需要覆盖的宏（默认占位见 ui_schedule.h / cam_client.cpp / weather_client.cpp）：
- *    - SCHEDULE_API_HOST          Mac 的 mDNS 主机名（不含 .local）
+ *  需要覆盖的宏（默认占位见 stocks_client.h / cam_client.cpp / weather_client.cpp）：
+ *    - SCHEDULE_API_HOST          Mac 的 mDNS 主机名（不含 .local；股票行情 /api/stocks 共用）
  *    - SCHEDULE_API_FALLBACK_URL  后端兜底 URL（mDNS 解析失败时用）
  *    - CAM_PROXY_HOST             摄像头帧代理（同 Mac 后端）主机名
  *    - CAM_PROXY_FALLBACK         摄像头帧代理兜底 IP

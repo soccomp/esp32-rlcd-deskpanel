@@ -1,6 +1,5 @@
 #include "ui_clock.h"
 #include "ui.h"                 // cn_label()
-#include "ui_schedule.h"       // ui_schedule_get_next_my_meeting()
 #include "ui_camera.h"         // ui_camera_thumb_init()：首页摄像头缩略预览
 #include "rtc_pcf85063.h"      // rtc_read_time / rtc_process_pending
 #include "lv_font_chinese_18.h"
@@ -510,14 +509,6 @@ void ui_clock_set_weather_time(const char *time_str)
     if (time_str && time_str[0]) {
         snprintf(g_wx_uptime_buf, sizeof(g_wx_uptime_buf), "%s", time_str);
     }
-}
-
-/* ============================================================
- *  迷你会议提示：首页反色卡已全部用于 X 帖文，不再显示会议。
- *  保留空函数以兼容 ui_schedule.cpp 的调用（会议页数据流不变）。
- * ============================================================ */
-void ui_clock_sync_meeting(void)
-{
 }
 
 /* ============================================================

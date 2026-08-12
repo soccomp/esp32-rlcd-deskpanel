@@ -13,7 +13,7 @@ lv_obj_t * cn_label(lv_obj_t * parent, const char * text);
 /* 构建全部 UI（在 Lvgl_lock 保护下首次调用） */
 void ui_init(void);
 
-/* 当前所在页面索引：0=主页 1=会议日程 2=环境 */
+/* 当前所在页面索引：0=主页 1=环境/吉他 2=摄像头 */
 uint8_t ui_get_current_page(void);
 
 /* 每秒更新一次的状态栏/主页时钟 */
@@ -34,5 +34,5 @@ void ui_next_page(void);
 /* 按键回调：循环切到上一页（0->2->1->0） */
 void ui_prev_page(void);
 
-/* 直接跳转到指定页面索引（0=主页 1=会议 2=环境），用于离开会议页回到首页 */
+/* 直接跳转到指定页面索引（0=主页 1=环境/吉他 2=摄像头） */
 void ui_goto_page(uint8_t p);
