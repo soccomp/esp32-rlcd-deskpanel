@@ -1,8 +1,7 @@
 #include "ui.h"
-#include "ui_schedule.h"
-#include "ui_clock.h"          // 主页（翻页钟 + 环境 + 我的会议）模块
-#include "ui_ambient.h"        // 环境与趣味页（木鱼 + 雷达）模块
-#include "ui_camera.h"         // 摄像头预览页（第 4 页）
+#include "ui_clock.h"          // 主页（翻页钟 + 环境 + 行情/天气）模块
+#include "ui_ambient.h"        // 环境与趣味页（木鱼 + 雷达 + 和弦）模块
+#include "ui_camera.h"         // 摄像头预览页（第 3 页）
 #include "lvgl.h"
 #include "lv_font_chinese_18.h"
 
@@ -13,7 +12,7 @@ static lv_obj_t * g_sb_battery = NULL;
 
 static uint8_t g_page = 0;
 
-/* ----- 辅助：创建带中文字体的标签（非 static，供 ui_schedule.cpp 等复用） ----- */
+/* ----- 辅助：创建带中文字体的标签（非 static，供各页面模块复用） ----- */
 lv_obj_t * cn_label(lv_obj_t * parent, const char * text)
 {
     lv_obj_t * lbl = lv_label_create(parent);
@@ -25,15 +24,8 @@ lv_obj_t * cn_label(lv_obj_t * parent, const char * text)
 /* ----- 三个页面内容 ----- */
 static void build_clock_page(lv_obj_t * parent, lv_obj_t * status_bar)
 {
-    /* 主页交给独立模块：翻页数字钟 + 环境监测 + 我的下一场会议 */
+    /* 主页交给独立模块：翻页数字钟 + 环境监测 + 行情/天气卡 */
     ui_clock_init(parent, status_bar);
-}
-
-static void build_schedule_page(lv_obj_t * parent)
-{
-    /* 会议日程页：交给独立模块初始化（顶部指示栏 + 可滚动卡片列表）。
-     * 该模块在 Lvgl_lock 保护下被调用，内部自管筛选/重建逻辑。 */
-    ui_schedule_init(parent);
 }
 
 static void build_ambient_page(lv_obj_t * parent)
@@ -71,7 +63,7 @@ void ui_init(void)
     lv_label_set_text(g_sb_battery, LV_SYMBOL_BATTERY_FULL);
     lv_obj_align(g_sb_battery, LV_ALIGN_RIGHT_MID, -8, 0);
 
-    /* Tileview：四页水平排列，位于状态栏下方 */
+    /* Tileview：三页水平排列，位于状态栏下方 */
     g_tileview = lv_tileview_create(scr);
     lv_obj_set_size(g_tileview, SCREEN_W, SCREEN_H - STATUS_BAR_H);
     lv_obj_set_pos(g_tileview, 0, STATUS_BAR_H);
@@ -80,13 +72,10 @@ void ui_init(void)
     build_clock_page(p0, sb);
 
     lv_obj_t * p1 = lv_tileview_add_tile(g_tileview, 1, 0, LV_DIR_HOR);
-    build_schedule_page(p1);
+    build_ambient_page(p1);
 
     lv_obj_t * p2 = lv_tileview_add_tile(g_tileview, 2, 0, LV_DIR_LEFT);
-    build_ambient_page(p2);
-
-    lv_obj_t * p3 = lv_tileview_add_tile(g_tileview, 3, 0, LV_DIR_LEFT);
-    build_camera_page(p3);
+    build_camera_page(p2);
 
     lv_obj_set_tile_id(g_tileview, 0, 0, LV_ANIM_OFF);
 }
@@ -124,7 +113,7 @@ void ui_update_ambient(float temp, float humi)
 void ui_next_page(void)
 {
     if (!g_tileview) return;
-    g_page = (g_page + 1) % 4;
+    g_page = (g_page + 1) % 3;
     /* 反射屏刷新慢，关掉切换动画，直接跳页更干脆 */
     lv_obj_set_tile_id(g_tileview, g_page, 0, LV_ANIM_OFF);
 }
@@ -132,15 +121,15 @@ void ui_next_page(void)
 void ui_prev_page(void)
 {
     if (!g_tileview) return;
-    g_page = (g_page + 3) % 4;   // 上一页：0->3->2->1->0
+    g_page = (g_page + 2) % 3;   // 上一页：0->2->1->0
     lv_obj_set_tile_id(g_tileview, g_page, 0, LV_ANIM_OFF);
 }
 
-/* 直接跳转到指定页面（用于从会议页一键返回首页，无需硬重启） */
+/* 直接跳转到指定页面 */
 void ui_goto_page(uint8_t p)
 {
     if (!g_tileview) return;
-    g_page = p % 4;
+    g_page = p % 3;
     lv_obj_set_tile_id(g_tileview, g_page, 0, LV_ANIM_OFF);
 }
 

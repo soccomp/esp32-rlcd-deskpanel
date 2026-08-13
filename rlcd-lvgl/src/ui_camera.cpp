@@ -106,9 +106,15 @@ void ui_camera_timer(lv_timer_t *timer)
             gray_to_1bit_bayer(g_gray, CAM_DISP_W, CAM_DISP_H, g_1bit);
             if (g_img) {
                 lv_obj_invalidate(g_img);
-                lv_refr_now(NULL);   /* 实验：强制立即刷新，验证 invalidate->重绘 链路 */
-                /* 诊断（限速）：UI 观察到新 seq 并 invalidate */
-                if (++ui_diag >= 8) { ui_diag = 0;
+                /* 8-13 修复：删除 lv_refr_now(NULL)——本回调在 lv_timer_handler
+                 * 内执行（已持 Lvgl 锁），此时强制立即刷新会与正在进行的刷新
+                 * 重入，损坏 LVGL 刷新状态机（draw_buf_flush 读 NULL ->
+                 * LoadProhibited 崩溃；st static 修复帧通后每 500ms 触发一次）。
+                 * lv_obj_invalidate 已足够，LVGL 定时器会自行调度刷新。 */
+                /* 诊断（限速）：UI 观察到新 seq 并 invalidate。
+                 * 8-13：6帧/次 -> 32帧/次（约 16s 一条），进一步降低 TX 压力，
+                 * 避免 TX 满时非阻塞 printf 连 ACK 一起丢弃。 */
+                if (++ui_diag >= 32) { ui_diag = 0;
                     Serial.printf("[cam-ui] new seq=%u invalidate+refr\n", (unsigned)seq);
                 }
             }

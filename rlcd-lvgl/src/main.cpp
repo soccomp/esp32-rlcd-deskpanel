@@ -8,17 +8,17 @@
 #include "display_bsp.h"
 #include "lvgl_bsp.h"
 #include "ui.h"
-#include "ui_schedule.h"
-#include "ui_clock.h"          // ui_clock_init / ui_clock_sync_meeting / shtc3_read
+#include "ui_clock.h"          // ui_clock_init / shtc3_read
 #include "weather_client.h"   // fetch_weather_data：ESP32 直连 Open-Meteo
 #include "rtc_pcf85063.h"     // PCF85063A RTC 驱动
-#include "ui_ambient.h"       // 环境与趣味页（Page 2）：木鱼 / 雷达
+#include "ui_ambient.h"       // 环境与趣味页（Page 1）：木鱼 / 雷达 / 和弦
 #include "cam_client.h"       // 摄像头客户端：mDNS 发现 esp32cam + 拉帧解码
 #include "audio_es8311.h"     // ES8311 CODEC + I2S 播放（非阻塞）
 #include "shtc3.h"
 #include "sd_card.h"          // SD 卡驱动（SDMMC 1线）
 #include "log_store.h"        // 本地日志落盘（/sdcard/log）
 #include "data_cache.h"       // 离线数据缓存（JSON 快照）
+#include "stocks_client.h"    // 股票指数行情：mDNS 找本机后端 GET /api/stocks
 #include "ota_backup.h"       // OTA 固件备份（升级前存 SD）
 
 /* ----- 硬件对象与引脚 ----- */
@@ -30,8 +30,8 @@ static I2cMasterBus *g_i2c_bus = nullptr;   // SHTC3 I2C: SCL=14, SDA=13
 static Shtc3Port    *g_shtc3    = nullptr;
 
 // 物理左键 = KEY GPIO18，右键 = BOOT GPIO0（Waveshare ESP32-S3-RLCD-4.2 实物，面对屏幕方向）
-#define BTN_LEFT_GPIO  18    // 左键：短按=下一页(会议) / 会议页短按下卡 / 长按切筛选
-#define BTN_RIGHT_GPIO 0     // 右键：短按=上一页(吉他) / 会议页短按上卡 / 吉他拨弦 / 长按离开会议页
+#define BTN_LEFT_GPIO  18    // 左键：短按=下一页 / 吉他页短按=切和弦
+#define BTN_RIGHT_GPIO 0     // 右键：短按=上一页 / 吉他页短按=拨弦 / 长按=切和弦组
 
 // Wi-Fi 凭据列表：设备启动时依次尝试，哪个先连上就用哪个
 // 真实凭据在本地 src/wifi_config.h（已被 .gitignore 忽略，不提交 GitHub）；
@@ -66,11 +66,9 @@ static time_t g_epoch_base = BASE_EPOCH;
 static bool g_wifi_prev = false;
 static bool g_ntp_done = false;
 static bool g_bat_printed = false;   // 一次性打印电池电压用于验证
-static uint32_t g_last_sched = 0;    // 上次拉取会议日程的时刻
 static uint32_t g_last_weather = 0;   // 上次直连尝试拉取天气的时刻
 static uint32_t g_last_stocks = 0;    // 上次拉取股票行情的时刻（交易时段 10 分钟一次）
 static uint32_t g_last_wifi_retry = 0;  // 上次 WiFi 重连尝试的时刻（掉线后 30s 重试）
-static uint32_t g_last_backend_probe = 0;  // 非工作时段：上次探测后端可达性的时刻（15 分钟一次）
 static bool g_weather_ready = false;  // 最近一次拉取是否成功（失败时 5 分钟重试）
 static uint8_t g_weather_fail_cnt = 0; // 连续失败次数（指数退避：2^n 分钟，上限 1 小时）
 static bool g_weather_permanent = false; // 永久失败（401/403/404）→ 24h 后再试
@@ -80,9 +78,15 @@ static bool g_weather_permanent = false; // 永久失败（401/403/404）→ 24h
 /* ----- LVGL flush：把 RGB565 帧缓冲按阈值转成 ST7305 单色 ----- */
 static void Lvgl_FlushCallback(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_map)
 {
+    /* 8-13 审核修复：防御性 clamp——LVGL full_refresh 异常时 area 可能越界，
+     * 直接按屏尺寸截断，杜绝 SetPixel 越界写（见 display_bsp.cpp RLCD_SetPixel）。 */
+    int x1 = area->x1 < 0 ? 0 : area->x1;
+    int y1 = area->y1 < 0 ? 0 : area->y1;
+    int x2 = area->x2 >= SCREEN_W ? SCREEN_W - 1 : area->x2;
+    int y2 = area->y2 >= SCREEN_H ? SCREEN_H - 1 : area->y2;
     uint16_t *buffer = (uint16_t *)color_map;
-    for (int y = area->y1; y <= area->y2; y++) {
-        for (int x = area->x1; x <= area->x2; x++) {
+    for (int y = y1; y <= y2; y++) {
+        for (int x = x1; x <= x2; x++) {
             uint8_t color = (*buffer < 0x7fff) ? ColorBlack : ColorWhite;
             RlcdPort->RLCD_SetPixel(x, y, color);
             buffer++;
@@ -115,8 +119,7 @@ static void IRAM_ATTR btn_isr(void)
 
 /* ----- Wi-Fi / 时间 ----- */
 /* 工作时段判断：工作日(周一~周五) 08:00-18:00 为工作时段。
- * 非工作时段（工作日 18:00-次日 8:00 + 周末全天）：天气/会议/X帖文不周期刷新，
- * 仅每 15 分钟探测后端可达性，后端恢复（电脑开机）时强制全量刷新。 */
+ * 非工作时段（工作日 18:00-次日 8:00 + 周末全天）：天气/行情不周期刷新。 */
 static bool is_work_hours(void)
 {
     time_t now = time(nullptr);
@@ -264,23 +267,18 @@ void loop()
     static uint32_t last_sec = 0;
     uint32_t now = millis();
 
-    /* ----- 左键：会议页 -> 短按下页 / 长按筛选；其他页 -> 下一页(会议) ----- */
+    /* ----- 左键：短按=下一页；吉他页短按=切和弦；长按=下一页 ----- */
     if (g_btn_release) {
         g_btn_release = false;
         uint32_t dur = g_btn_dur_ms;
-        bool is_sched = (ui_get_current_page() == 1);
         if (dur >= LONG_PRESS_MS) {
-            if (is_sched) {
-                if (Lvgl_lock(100)) { ui_schedule_toggle_filter(); Lvgl_unlock(); }
-            } else if (Lvgl_lock(10)) {
+            if (Lvgl_lock(10)) {
                 ui_next_page();
                 Lvgl_unlock();
             }
         } else if (dur >= 40) {
-            if (is_sched) {
-                if (Lvgl_lock(100)) { ui_schedule_next_page(); Lvgl_unlock(); }
-            } else if (ui_get_current_page() == 2) {
-                /* Page 2：KEY 键切换到下一个和弦 + 播放音频 */
+            if (ui_get_current_page() == 1) {
+                /* 吉他页：KEY 键切换到下一个和弦 + 播放音频 */
                 if (Lvgl_lock(100)) { ui_ambient_next_chord(); Lvgl_unlock(); }
             } else if (Lvgl_lock(10)) {
                 ui_next_page();
@@ -308,25 +306,18 @@ void loop()
         prev_level = cur;
     }
 
-    /* ----- 右键：会议页 -> 短按上页 / 长按离开本页；其他页 -> 上一页(吉他) ----- */
+    /* ----- 右键：短按=上一页；吉他页短按=拨弦 / 长按=切和弦组 ----- */
     if (g_btn2_release) {
         g_btn2_release = false;
         uint32_t dur = g_btn2_dur_ms;
-        bool is_sched = (ui_get_current_page() == 1);
         if (dur >= LONG_PRESS_MS) {
-            if (is_sched) {
-                /* 长按离开会议页，回到首页（不再需要硬重启） */
-                if (Lvgl_lock(10)) { ui_goto_page(0); Lvgl_unlock(); }
-            }
-            else if (ui_get_current_page() == 2) {
-                /* Page 2：BOOT 长按切换 OPEN / 7TH 和弦练习组 */
+            if (ui_get_current_page() == 1) {
+                /* 吉他页：BOOT 长按切换 OPEN / 7TH 和弦练习组 */
                 if (Lvgl_lock(100)) { ui_ambient_next_group(); Lvgl_unlock(); }
             }
         } else if (dur >= 40) {
-            if (is_sched) {
-                if (Lvgl_lock(100)) { ui_schedule_prev_page(); Lvgl_unlock(); }
-            } else if (ui_get_current_page() == 2) {
-                /* Page 2：BOOT 短按播放当前和弦并增加练习计数 */
+            if (ui_get_current_page() == 1) {
+                /* 吉他页：BOOT 短按播放当前和弦并增加练习计数 */
                 if (Lvgl_lock(50)) { ui_ambient_tap(); Lvgl_unlock(); }
             } else if (Lvgl_lock(10)) {
                 ui_prev_page();
@@ -337,28 +328,46 @@ void loop()
 
     /* ----- RLCD-004：USB-CDC 手势命令切页（M1 侧识别手指数量后下发 PAGE:xxx） -----
      * 命令由 cam_task 解析并登记，这里在主循环取走执行，切页与按键走同一套
-     * Lvgl_lock + ui_goto_page 路径；已在目标页则不重复切，避免无谓刷屏。 */
+     * Lvgl_lock + ui_goto_page 路径；已在目标页则不重复切，避免无谓刷屏。
+     * RLCD-004.2 审核修正：ACK 只在**实际页面状态已确认**后发送——
+     * 切页后校验 ui_get_current_page()==目标页才 ACK；Lvgl_lock 失败/切页
+     * 未生效则不 ACK（M1 超时自动重发），彻底消除"命令已收到=已切页"的假 ACK。 */
     {
         int8_t req = cam_client_take_page_cmd();
-        if (req >= 0 && req != (int8_t)ui_get_current_page()) {
-            if (Lvgl_lock(100)) {
+        if (req >= 0) {
+            /* 解析日志（rx_task 不再 printf，由 main 统一输出，避免三方并发访问 CDC） */
+            const char *name = (req == 0) ? "HOME" :
+                               (req == 1) ? "GUITAR" :
+                               (req == 2) ? "CAMERA" : "?";
+            cam_client_log("[cmd] PAGE:%s -> page %d\n", name, (int)req);
+            if (req == (int8_t)ui_get_current_page()) {
+                /* 已在目标页：页面状态已确认，直接 ACK */
+                cam_client_send_ack(req);
+                cam_client_log("[cmd] page %d already current, skip (gesture)\n", (int)req);
+            } else if (Lvgl_lock(1000)) {   /* 反射屏全屏刷新可占锁数百 ms，100ms 偏短 */
                 ui_goto_page((uint8_t)req);
                 Lvgl_unlock();
-                Serial.printf("[cmd] page -> %d (gesture)\n", (int)req);
+                if ((int8_t)ui_get_current_page() == req) {
+                    cam_client_send_ack(req);   /* 实际切换成功 -> ACK */
+                    cam_client_log("[cmd] page -> %d (gesture)\n", (int)req);
+                } else {
+                    /* 切页未生效（异常）-> 不 ACK，M1 将超时重发 */
+                    cam_client_log("[cmd] page -> %d FAILED (cur=%d), no ACK\n",
+                                  (int)req, (int)ui_get_current_page());
+                }
+            } else {
+                /* Lvgl_lock 失败 -> 不 ACK，M1 将超时重发 */
+                cam_client_log("[cmd] Lvgl_lock failed, page %d not switched, no ACK\n", (int)req);
             }
-        } else if (req >= 0) {
-            /* RLCD-004.1：收到命令但已在目标页，记录 no-op 便于排查，不重复切 */
-            Serial.printf("[cmd] page %d already current, skip (gesture)\n", (int)req);
         }
     }
 
-    /* 进入页面检测：进入吉他页触发雷达扫描；进入会议页自动刷新日程 */
+    /* 进入页面检测：进入吉他页触发雷达扫描 */
     {
         static uint8_t last_pg = 0xFF;
         uint8_t pg = ui_get_current_page();
         if (pg != last_pg) {
-            if (pg == 2) ui_ambient_on_show();
-            else if (pg == 1) { fetch_schedule_data(); }
+            if (pg == 1) ui_ambient_on_show();
             last_pg = pg;
         }
     }
@@ -372,9 +381,7 @@ void loop()
             g_wifi_prev = connected;
             if (connected) {
                 Serial.printf("WiFi connected, IP=%s\n", WiFi.localIP().toString().c_str());
-                /* 刚连上：立即拉取一次会议日程 + 直连天气 + 启动摄像头客户端 */
-                g_last_sched = now;
-                fetch_schedule_data();
+                /* 刚连上：立即拉取一次行情 + 直连天气 + 启动摄像头客户端 */
                 g_last_stocks = now;
                 fetch_stocks_data();         /* 行情：连上即拉一次 */
                 g_last_weather = now;
@@ -416,11 +423,6 @@ void loop()
             }
 
             if (work_hours) {
-                /* 已连接且距上次拉取 >= 1 小时：周期刷新（仅工作时段） */
-                if (now - g_last_sched >= 3600000UL) {
-                    g_last_sched = now;
-                    fetch_schedule_data();
-                }
                 /* 天气刷新间隔（指数退避）：
                  *  - 成功 → 1 小时
                  *  - 可恢复失败（网络/429）→ 2^n 分钟（2/4/8/16/32/60 封顶）
@@ -445,21 +447,6 @@ void loop()
                     g_weather_permanent = (wr == WEATHER_PERMANENT);
                     if (g_weather_ready) g_weather_fail_cnt = 0;
                     else g_weather_fail_cnt++;
-                }
-            } else {
-                /* 非工作时段：不周期刷新。每 15 分钟轻量探测后端可达性（电脑开机检测）；
-                 * 探测命中 → 强制全量刷新（天气/会议/行情），不等正常周期。 */
-                if (now - g_last_backend_probe >= 15 * 60 * 1000UL) {
-                    g_last_backend_probe = now;
-                    if (probe_backend()) {
-                        Serial.println("[probe] backend alive, force refresh");
-                        g_last_sched = now;
-                        fetch_schedule_data();
-                        g_last_weather = now;
-                        g_weather_ready = fetch_weather_data();
-                        g_last_stocks = now;
-                        fetch_stocks_data();
-                    }
                 }
             }
             /* 股票行情：交易时段（工作日 09:30-11:30 / 13:00-15:00）每 10 分钟刷新；
@@ -503,22 +490,6 @@ void loop()
                 Serial.printf("BAT raw=%dmV, estimated=%d%%, USB=%d\n", raw/4, bat, (int)(raw/4 * BAT_DIVIDER));
             }
             Lvgl_unlock();
-        }
-
-        /* 会议 10 分钟预告：我的下一场会议进入 10 分钟窗口时，滴滴提醒一次 */
-        {
-            static time_t last_remind = 0;
-            time_t mt = 0;
-            if (ui_schedule_get_next_my_meeting_epoch(&mt)) {
-                time_t diff = mt - time(nullptr);
-                if (diff <= 600 && diff > -120 && mt != last_remind) {
-                    last_remind = mt;
-                    audio_play_beep();
-                    Serial.println("[ambient] 会议 10 分钟预告提醒");
-                }
-            } else {
-                last_remind = 0;   // 无未来会议，复位避免漏报
-            }
         }
     }
 

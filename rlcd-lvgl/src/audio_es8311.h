@@ -23,7 +23,7 @@ void audio_play_chord(uint8_t idx);
 /* 返回可用和弦数量（用于取模循环） */
 uint8_t audio_chord_count(void);
 
-/* 非阻塞：播放两声温和提醒 beep（会议 10 分钟预告用） */
+/* 非阻塞：播放两声温和提醒 beep（通用提醒用） */
 void audio_play_beep(void);
 
 /* 设置 ES8311 DAC 音量寄存器 0..255（约 -95.5dB .. +32dB），默认 0xA8 */

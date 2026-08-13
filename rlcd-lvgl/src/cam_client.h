@@ -44,7 +44,17 @@ bool cam_client_has_frame(void);
 bool cam_client_is_fresh(void);
 
 /* RLCD-004：取走一条待处理的页面切换命令（USB-CDC 通道收到的 "PAGE:xxx"）。
- * 返回 0=首页 1=会议页 2=吉他页，无待处理命令返回 -1；取走即清空。
+ * 返回 0=首页 1=吉他页 2=摄像头页，无待处理命令返回 -1；取走即清空。
  * 由 loop() 轮询调用，并在 Lvgl_lock 保护下执行 ui_goto_page()——
  * 解析发生在 cam_task，绝不在该任务内直接操作 LVGL 对象。 */
 int8_t cam_client_take_page_cmd(void);
+
+/* RLCD-004.2（审核修正）：ACK 只在**实际页面状态已确认**后发送。
+ * 语义 = "页面已真正切换/已在该页"，而非"命令已收到"。
+ * 调用方（main.cpp）必须在 ui_goto_page 成功且 ui_get_current_page()==目标页
+ * （或已在目标页）时才调用；Lvgl_lock 失败/切页未生效时不得调用。 */
+void cam_client_send_ack(int8_t page);
+
+/* 带锁 printf（8-12）：与 rx_task 的 Serial 读互斥，防 TinyUSB CDC 跨核并发崩溃。
+ * 各任务（cam_task/main）输出日志统一走这里。 */
+void cam_client_log(const char *fmt, ...);

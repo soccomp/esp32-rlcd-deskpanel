@@ -216,6 +216,11 @@ weather_result_t fetch_weather_data(void)
         http.begin(*client, url);   /* 复用已连接 socket */
     } else {
         Serial.printf("[weather] connect fail, fallback backend\n");
+        /* 8-12 崩溃修复：连接失败后 **不 delete client**——WiFiClientSecure 在
+         * TLS 握手失败（start_ssl_client:-1）后的析构偶发 PANIC（reset reason 4，
+         * 每次重启->WiFi 连上->天气刷新即复现）。泄漏一个 client 对象（~KB 级），
+         * 天气失败有指数退避（2^n 分钟），重启清零，远好于崩溃。 */
+        client = nullptr;
     }
     http.setTimeout(8000);
     http.setUserAgent("ESP32-RLCD-DeskPanel");
@@ -266,7 +271,7 @@ weather_result_t fetch_weather_data(void)
         }
     }
 
-    delete client;
+    if (client) { delete client; }   /* 仅连接成功才析构（失败路径已置空，防 PANIC） */
     if (success) return WEATHER_OK;
     return result;   /* 保留永久/可恢复分类 */
 }

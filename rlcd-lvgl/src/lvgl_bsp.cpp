@@ -33,10 +33,25 @@ void Lvgl_unlock(void)
 static void Lvgl_port_task(void *arg)
 {
   	uint32_t task_delay_ms = LVGL_TASK_MAX_DELAY_MS;
+  	static void *last_top = (void *)-1;
+  	static void *last_act = (void *)-1;
   	for(;;)
   	{
   	  	if (Lvgl_lock(-1))
   	  	{
+  	  	  	/* 8-13 诊断：监视 disp 指针突变——top_layer/act_scr 被清零
+  	  	  	 * 是 LoadProhibited 崩溃的直接前兆，记录清零时刻对齐行为日志 */
+  	  	  	lv_disp_t *d = lv_disp_get_default();
+  	  	  	if (d) {
+  	  	  	  	if ((void*)d->top_layer != last_top) {
+  	  	  	  	  	Serial.printf("[lvgl] top_layer %p -> %p\n", last_top, (void*)d->top_layer);
+  	  	  	  	  	last_top = (void*)d->top_layer;
+  	  	  	  	}
+  	  	  	  	if ((void*)d->act_scr != last_act) {
+  	  	  	  	  	Serial.printf("[lvgl] act_scr %p -> %p\n", last_act, (void*)d->act_scr);
+  	  	  	  	  	last_act = (void*)d->act_scr;
+  	  	  	  	}
+  	  	  	}
   	  	  	task_delay_ms = lv_timer_handler();
   	  	  	//Release the mutex
   	  	  	Lvgl_unlock();
@@ -80,5 +95,9 @@ void Lvgl_PortInit(int width, int height, DispFlushCb flush_cb) {
   	ESP_ERROR_CHECK(esp_timer_create(&lvgl_tick_timer_args, &lvgl_tick_timer));
   	ESP_ERROR_CHECK(esp_timer_start_periodic(lvgl_tick_timer,LVGL_TICK_PERIOD_MS * 1000));
 
-    xTaskCreatePinnedToCore(Lvgl_port_task, "LVGL", 8 * 1024, NULL, 5, NULL, 0);
+    /* 8-13 审核修复：栈 8KB -> 16KB。tileview 全量布局递归（4 页对象树全量计算）
+     * 时 lv_obj_update_layout 栈峰值可超 8KB；溢出会向下踩内部 RAM 堆区，
+     * 把 lv_disp_t.top_layer/act_scr 清零 -> 下个刷新 tick lv_obj_update_layout(NULL)
+     * LoadProhibited 崩溃（密集切页时频繁全量布局 -> 高频触发）。 */
+    xTaskCreatePinnedToCore(Lvgl_port_task, "LVGL", 16 * 1024, NULL, 5, NULL, 0);
 }

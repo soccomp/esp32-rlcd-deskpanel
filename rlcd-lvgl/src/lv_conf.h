@@ -120,10 +120,12 @@
 #define LV_USE_ASSERT_NULL          1
 #define LV_USE_ASSERT_MALLOC        1
 #define LV_USE_ASSERT_STYLE         0
-#define LV_USE_ASSERT_MEM_INTEGRITY 0
+#define LV_USE_ASSERT_MEM_INTEGRITY 1
 #define LV_USE_ASSERT_OBJ           0
 #define LV_ASSERT_HANDLER_INCLUDE <stdint.h>
-#define LV_ASSERT_HANDLER while(1);
+/* 8-13：abort 触发 ESP-IDF panic（打印 backtrace）而非 while(1) 死循环
+ * （死循环只会静默触发 TWDT 重启，看不到任何信息）。 */
+#define LV_ASSERT_HANDLER abort();
 
 /*-------------
  * Others

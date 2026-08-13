@@ -72,7 +72,7 @@
 <header>
   <div class="wrap">
     <h1>ESP32-S3-RLCD 桌面面板 · 操作使用说明</h1>
-    <p>Waveshare ESP32-S3-RLCD-4.2 · 400×300 反射式单色屏 · 三页 UI（时间天气 / 会议 / 吉他解压）</p>
+    <p>Waveshare ESP32-S3-RLCD-4.2 · 400×300 反射式单色屏 · 三页 UI（时间天气 / 吉他解压 / 摄像头）</p>
   </div>
 </header>
 
@@ -85,13 +85,13 @@
 
   <!-- ============ 按键 ============ -->
   <h2>① 三个键分别是什么</h2>
-  <p>面对屏幕、键在顶端，从左到右（已按你手上的实机核定）：<span class="tag">左 BOOT</span> <span class="tag" style="background:#c77000">中 PWR</span> <span class="tag">右 KEY</span>。板上的丝印是 <code>BOOT</code> / <code>PWR</code> / <code>KEY</code>；实际 GPIO 为 <b>左=GPIO0、右=GPIO18</b>。固件把这两颗键映射成：<b>左键＝下一页/会议导航</b>，<b>右键＝上一页/吉他/离开会议</b>。</p>
+  <p>面对屏幕、键在顶端，从左到右（已按你手上的实机核定）：<span class="tag">左 BOOT</span> <span class="tag" style="background:#c77000">中 PWR</span> <span class="tag">右 KEY</span>。板上的丝印是 <code>BOOT</code> / <code>PWR</code> / <code>KEY</code>；实际 GPIO 为 <b>左=GPIO0、右=GPIO18</b>。固件把这两颗键映射成：<b>左键＝下一页</b>，<b>右键＝上一页</b>；在吉他页里左/右键分别负责切和弦与拨弦。</p>
 
   <div class="keys">
     <div class="key">
       <div class="role">左键 · BOOT（GPIO0）</div>
       <div class="gpio">低电平有效，可编程</div>
-      <div class="act">首页：短按/长按都 = <b>下一页</b>（去会议页）<br>会议页：短按 = 会议卡片下翻；长按 = 切换「全部 / 我的会议」<br>吉他页：短按 = <b>回首页</b></div>
+      <div class="act">短按/长按 = <b>下一页</b>（首页→吉他→摄像头→首页）<br>吉他页：短按 = <b>切换和弦</b>（Cmaj7→Am7→Dm7→G7）</div>
     </div>
     <div class="key mid">
       <div class="role">中键 · PWR（硬复位）</div>
@@ -101,7 +101,7 @@
     <div class="key">
       <div class="role">右键 · KEY（GPIO18）</div>
       <div class="gpio">低电平有效，可编程</div>
-      <div class="act">首页：短按 = <b>上一页</b>（去吉他页）<br>吉他页：短按 = <b>拨弦</b>（扫弦+音效）<br>会议页：短按 = 卡片上翻；<b>长按 = 离开本页（回首页）</b></div>
+      <div class="act">短按 = <b>上一页</b>（摄像头→吉他→首页）<br>吉他页：短按 = <b>拨弦</b>（扫弦+音效）；长按 = <b>切换和弦练习组</b></div>
     </div>
   </div>
 
@@ -131,59 +131,62 @@
       <!-- 标注 -->
       <text x="320" y="295" text-anchor="middle" font-size="12" fill="#1a1a1a">↑ 板子顶端三键：左 BOOT · 中 PWR · 右 KEY</text>
     </svg>
-    <div class="cap">设备俯视示意（屏在板中央，三键在顶端边缘）。左键=下一页/会议，右键=上一页/吉他/离开。</div>
+    <div class="cap">设备俯视示意（屏在板中央，三键在顶端边缘）。左键=下一页，右键=上一页。</div>
   </div>
 
   <!-- ============ 三页总览 ============ -->
   <h2>② 三个页面是什么</h2>
   <table>
     <tr><th>页码</th><th>名称</th><th>内容</th></tr>
-    <tr><td><b>0</b></td><td>首页 / 时间天气页</td><td>翻页数字钟（时:分）、日期星期、左下室内温湿度+今/明日天气、右下「我的下一场会议」黑底白字卡</td></tr>
-    <tr><td><b>1</b></td><td>会议日程页</td><td>可翻页的会议卡片列表（每屏 3 张），顶部指示栏显示「全部会议 N · 第x/y页」或「我的会议 N · 第x/y页」</td></tr>
-    <tr><td><b>2</b></td><td>环境 / 吉他解压页</td><td>左侧电吉他（拨弦+和弦+摇滚功德），右侧环境监测卡 + 办公室热闹雷达</td></tr>
+    <tr><td><b>0</b></td><td>首页 / 时间天气页</td><td>翻页数字钟（时:分）、日期星期+法语短句、左下室内温湿度+今/明日天气、右上股票指数行情、右下摄像头缩略预览</td></tr>
+    <tr><td><b>1</b></td><td>环境 / 吉他解压页</td><td>左侧电吉他（拨弦+和弦+摇滚功德），右侧环境监测卡 + 办公室热闹雷达</td></tr>
+    <tr><td><b>2</b></td><td>摄像头页</td><td>320×240 全屏实时预览（由桌面 ESP32-CAM 经 USB 串口回传）</td></tr>
   </table>
 
   <div class="svgbox">
     <!-- 导航状态图 -->
-    <svg viewBox="0 0 640 260" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif">
-      <!-- 节点 -->
-      <g>
-        <rect x="40" y="100" width="150" height="60" rx="8" fill="#fff" stroke="#1a1a1a" stroke-width="2"/>
-        <text x="115" y="126" text-anchor="middle" font-size="14" font-weight="bold">首页 (0)</text>
-        <text x="115" y="146" text-anchor="middle" font-size="11" fill="#666">时间天气</text>
-
-        <rect x="245" y="100" width="150" height="60" rx="8" fill="#fff" stroke="#1a1a1a" stroke-width="2"/>
-        <text x="320" y="126" text-anchor="middle" font-size="14" font-weight="bold">会议页 (1)</text>
-        <text x="320" y="146" text-anchor="middle" font-size="11" fill="#0a6b2e">长按右键可离开</text>
-
-        <rect x="450" y="100" width="150" height="60" rx="8" fill="#fff" stroke="#1a1a1a" stroke-width="2"/>
-        <text x="525" y="126" text-anchor="middle" font-size="14" font-weight="bold">吉他页 (2)</text>
-        <text x="525" y="146" text-anchor="middle" font-size="11" fill="#666">环境/解压</text>
-      </g>
-      <!-- 边 -->
-      <g font-size="11">
-        <!-- 左键 下一页 0->1 -->
-        <line x1="190" y1="115" x2="243" y2="115" stroke="#1457b8" stroke-width="2" marker-end="url(#ar)"/>
-        <text x="216" y="108" text-anchor="middle" fill="#1457b8">左键 下一页</text>
-        <!-- 左键 下一页 1->2 -->
-        <line x1="395" y1="115" x2="448" y2="115" stroke="#1457b8" stroke-width="2" marker-end="url(#ar)"/>
-        <text x="421" y="108" text-anchor="middle" fill="#1457b8">左键 下一页</text>
-        <!-- 左键 下一页 2->0 (回首页) -->
-        <path d="M525,160 C525,215 115,215 115,162" fill="none" stroke="#1457b8" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#ar)"/>
-        <text x="320" y="232" text-anchor="middle" fill="#1457b8">吉他页按左键 回首页</text>
-        <!-- 右键 上一页 0->2 -->
-        <line x1="190" y1="145" x2="448" y2="145" stroke="#0a6b2e" stroke-width="2" marker-end="url(#ar2)"/>
-        <text x="320" y="162" text-anchor="middle" fill="#0a6b2e">右键 上一页：首页→吉他页</text>
-        <!-- 右键长按 离开会议页 1->0 -->
-        <path d="M320,160 C320,205 115,205 115,162" fill="none" stroke="#0a6b2e" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#ar2)"/>
-        <text x="220" y="200" text-anchor="middle" fill="#0a6b2e">右键长按 离开会议页</text>
-      </g>
+    <svg viewBox="0 0 640 250" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif">
       <defs>
         <marker id="ar" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#1457b8"/></marker>
         <marker id="ar2" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#0a6b2e"/></marker>
       </defs>
+      <!-- 节点 -->
+      <g>
+        <rect x="40" y="90" width="160" height="60" rx="8" fill="#fff" stroke="#1a1a1a" stroke-width="2"/>
+        <text x="120" y="116" text-anchor="middle" font-size="14" font-weight="bold">首页 (0)</text>
+        <text x="120" y="136" text-anchor="middle" font-size="11" fill="#666">时间/天气/行情</text>
+
+        <rect x="250" y="90" width="150" height="60" rx="8" fill="#fff" stroke="#1a1a1a" stroke-width="2"/>
+        <text x="325" y="116" text-anchor="middle" font-size="14" font-weight="bold">吉他页 (1)</text>
+        <text x="325" y="136" text-anchor="middle" font-size="11" fill="#666">环境/解压</text>
+
+        <rect x="450" y="90" width="150" height="60" rx="8" fill="#fff" stroke="#1a1a1a" stroke-width="2"/>
+        <text x="525" y="116" text-anchor="middle" font-size="14" font-weight="bold">摄像头页 (2)</text>
+        <text x="525" y="136" text-anchor="middle" font-size="11" fill="#666">实时预览</text>
+      </g>
+      <!-- 边 -->
+      <g font-size="11">
+        <!-- 左键 下一页 0->1 -->
+        <line x1="200" y1="105" x2="248" y2="105" stroke="#1457b8" stroke-width="2" marker-end="url(#ar)"/>
+        <text x="224" y="98" text-anchor="middle" fill="#1457b8">左键</text>
+        <!-- 左键 下一页 1->2 -->
+        <line x1="400" y1="105" x2="448" y2="105" stroke="#1457b8" stroke-width="2" marker-end="url(#ar)"/>
+        <text x="424" y="98" text-anchor="middle" fill="#1457b8">左键</text>
+        <!-- 左键 下一页 2->0 (回首页) -->
+        <path d="M525,150 C525,205 120,205 120,152" fill="none" stroke="#1457b8" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#ar)"/>
+        <text x="325" y="222" text-anchor="middle" fill="#1457b8">摄像头页按左键 回首页</text>
+        <!-- 右键 上一页 0->2 -->
+        <path d="M200,135 C200,190 525,190 525,152" fill="none" stroke="#0a6b2e" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#ar2)"/>
+        <text x="325" y="188" text-anchor="middle" fill="#0a6b2e">右键 上一页：首页→摄像头页</text>
+        <!-- 右键 上一页 2->1 -->
+        <line x1="448" y1="135" x2="400" y2="135" stroke="#0a6b2e" stroke-width="2" marker-end="url(#ar2)"/>
+        <text x="424" y="152" text-anchor="middle" fill="#0a6b2e">右键</text>
+        <!-- 右键 上一页 1->0 -->
+        <line x1="248" y1="135" x2="200" y2="135" stroke="#0a6b2e" stroke-width="2" marker-end="url(#ar2)"/>
+        <text x="224" y="152" text-anchor="middle" fill="#0a6b2e">右键</text>
+      </g>
     </svg>
-    <div class="cap">页面切换图：左键 = 下一页（顺时针 0→1→2→0），右键 = 上一页（首页直接跳到吉他页）。会议页内长按右键即可返回首页，不再需要硬重启。</div>
+    <div class="cap">页面切换图：左键 = 下一页（0→1→2→0），右键 = 上一页（0→2→1→0）。</div>
   </div>
 
   <!-- ============ 如何到各页 ============ -->
@@ -191,49 +194,12 @@
 
   <h3>🏠 切到首页（时间天气页）</h3>
   <div class="step"><b>最简单</b>：按中间的 <b>PWR</b> 键硬重启，开机默认停首页。</div>
-  <div class="step">若当前在<b>吉他页(2)</b>：按一下<b>左键</b>（下一页）→ 直接回首页。</div>
-  <div class="step">若当前在<b>会议页(1)</b>：<b>长按右键（≥0.6 秒）</b> → 离开会议页，回到首页（无需硬重启）。</div>
-
-  <h3>📅 切到会议页（全部会议）</h3>
-  <div class="step">从<b>首页(0)</b>：按一下<b>左键</b>（下一页）→ 进入会议页。</div>
-  <div class="step">从<b>吉他页(2)</b>：按一下 <b>左键</b>（吉他→首页），再按一下左键（首页→会议）。</div>
-  <div class="svgbox">
-    <!-- 会议页 mockup -->
-    <svg viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif">
-      <rect x="0" y="0" width="400" height="300" fill="#fff" stroke="#1a1a1a" stroke-width="2"/>
-      <!-- 指示栏 -->
-      <line x1="0" y1="22" x2="400" y2="22" stroke="#1a1a1a" stroke-width="1"/>
-      <text x="8" y="16" font-size="12" fill="#1a1a1a">全部会议 12 · 第1/4页</text>
-      <text x="392" y="16" text-anchor="end" font-size="10" fill="#666">左 下页·长按筛选   右 上页·长按退出</text>
-      <!-- 卡片1 我的会议(反色) -->
-      <rect x="8" y="30" width="384" height="78" rx="3" fill="#1a1a1a" stroke="#1a1a1a" stroke-width="1"/>
-      <text x="14" y="48" font-size="13" fill="#fff">产品双周会</text>
-      <text x="14" y="66" font-size="11" fill="#ddd">07-30 周三 14:00 · 会议室A</text>
-      <text x="14" y="84" font-size="11" fill="#ccc">主持 张三 · 承办 项目部</text>
-      <text x="14" y="102" font-size="11" fill="#bbb">参会 李四/王五…</text>
-      <text x="380" y="48" text-anchor="end" font-size="10" fill="#fff">我的</text>
-      <!-- 卡片2 -->
-      <rect x="8" y="112" width="384" height="64" rx="3" fill="#fff" stroke="#1a1a1a" stroke-width="1"/>
-      <text x="14" y="130" font-size="13" fill="#1a1a1a">需求评审</text>
-      <text x="14" y="148" font-size="11" fill="#444">07-30 周三 16:00 · 线上</text>
-      <text x="14" y="166" font-size="11" fill="#666">主持 赵六</text>
-      <!-- 卡片3 -->
-      <rect x="8" y="180" width="384" height="64" rx="3" fill="#fff" stroke="#1a1a1a" stroke-width="1"/>
-      <text x="14" y="198" font-size="13" fill="#1a1a1a">周会</text>
-      <text x="14" y="216" font-size="11" fill="#444">07-31 周四 09:30 · 会议室B</text>
-      <text x="14" y="234" font-size="11" fill="#666">主持 钱七</text>
-    </svg>
-    <div class="cap">会议页（第1页）示意：顶部指示栏 + 每屏 3 张会议卡；带「我的」标记的卡片为反色黑底。长按右键即可退出本页。</div>
-  </div>
-
-  <h3>⭐ 切到「我的会议」视图</h3>
-  <p>「我的会议」<b>不是独立页面</b>，而是会议页的一种<b>筛选状态</b>。进入会议页后：</p>
-  <div class="step">在会议页内<b>长按左键（≥0.6 秒）</b> → 在「全部会议」与「我的会议」之间切换。顶部指示栏文字会从「全部会议…」变成「我的会议…」，卡片只留下标了「我的」的会议（反色黑底）。再长按一次切回全部。</div>
-  <div class="ok">提示：会议数据来自后端/离线兜底；连上 Wi-Fi 后约 1 小时自动刷新一次，并且<b>每次打开会议页都会自动拉取一次最新日程</b>（无需手动刷新）。</div>
+  <div class="step">若当前在<b>吉他页(1)</b>：按一下<b>左键</b>（下一页）→ 回首页。</div>
+  <div class="step">若当前在<b>摄像头页(2)</b>：按一下<b>左键</b>（下一页）→ 回首页。</div>
 
   <h3>🎸 切到吉他拨弦页（环境/趣味页）</h3>
-  <div class="step">从<b>首页(0)</b>：按一下<b>右键</b>（上一页）→ 进入吉他页。这是看到吉他页最直接的方式。</div>
-  <div class="step">从<b>会议页(1)</b>：<b>长按右键</b>离开会议页回到首页，再按<b>右键</b>去吉他页；或直接从会议页长按右键离开后连续按两次右键。</div>
+  <div class="step">从<b>首页(0)</b>：按一下<b>左键</b>（下一页）→ 进入吉他页。这是看到吉他页最直接的方式。</div>
+  <div class="step">从<b>摄像头页(2)</b>：按一下<b>右键</b>（上一页）→ 进入吉他页。</div>
   <div class="svgbox">
     <!-- 吉他页 mockup -->
     <svg viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg" font-family="sans-serif">
@@ -275,27 +241,31 @@
       <circle cx="330" cy="225" r="3" fill="#1a1a1a"/>
       <text x="306" y="276" font-size="9" fill="#444">周围设备: 6 台</text>
     </svg>
-    <div class="cap">吉他页（第2页）示意：左侧吉他 + 和弦横幅 + 摇滚功德；右侧环境监测卡 + 热闹雷达（扫描线每 2.2 秒转一圈）。</div>
+    <div class="cap">吉他页（第1页）示意：左侧吉他 + 和弦横幅 + 摇滚功德；右侧环境监测卡 + 热闹雷达（扫描线每 2.2 秒转一圈）。</div>
   </div>
 
   <h3>🎵 在吉他页怎么拨弦</h3>
-  <p>吉他页里，<b>右键 = 拨弦键</b>（左键在此时负责"离开本页"，见下）。</p>
-  <div class="step">在吉他页<b>短按右键</b> → 触发一次扫弦：和弦横幅切换（Cmaj7→Am7→Dm7→G7 循环）、6 根琴弦依次振动、扬声器播出琶音、「摇滚功德」+1，并飘出 <code>ROCK +1</code>。想连弹就连续短按。</div>
-  <div class="step">要<b>离开吉他页</b>：按<b>左键</b>（下一页）→ 回首页。（吉他页里右键只拨弦、不翻页。）</div>
+  <p>吉他页里，<b>右键 = 拨弦键</b>，<b>左键 = 切和弦</b>。</p>
+  <div class="step">在吉他页<b>短按右键</b> → 触发一次扫弦：6 根琴弦依次振动、扬声器播出当前和弦琶音、「摇滚功德」+1。想连弹就连续短按。</div>
+  <div class="step">在吉他页<b>短按左键</b> → 切换到下一个和弦（Cmaj7→Am7→Dm7→G7 循环）；<b>长按右键</b> → 在 OPEN / 7TH 两个和弦练习组之间切换。</div>
+  <div class="step">要<b>离开吉他页</b>：按<b>左键</b>（下一页）→ 摄像头页；或按<b>右键</b>（上一页）→ 回首页。</div>
+
+  <h3>📷 切到摄像头页</h3>
+  <div class="step">从<b>首页(0)</b>：按一下<b>右键</b>（上一页）→ 进入摄像头页。全屏实时预览，摄像头离线时显示"离线"提示。</div>
+  <div class="step">从<b>吉他页(1)</b>：按一下<b>左键</b>（下一页）→ 进入摄像头页。</div>
 
   <!-- ============ 注意事项 ============ -->
   <h2>④ 必须知道的注意事项</h2>
 
   <div class="ok">
-    <b>✅ 会议页陷阱已修复：长按右键即可离开。</b><br>
-    老固件里进入会议页后，左右键都被困在会议页内部（翻卡片/筛选/刷新），没有任何键能离开，只能硬重启。新固件改为：在会议页<b>长按右键（≥0.6 秒）</b>直接返回首页；<b>短按右键</b>仍是上翻卡片，<b>短按/长按左键</b>仍是下翻/筛选。手动刷新改为"打开会议页自动拉取一次"，无需再长按刷新。
+    <b>✅ 会议日程页已移除。</b><br>
+    本固件不再拉取/展示会议日程，设备上不存在会议页。若你不再需要 M1 上的会议后端（schedule-api 服务），可以自行停用，不影响设备其它功能（天气直连 Open-Meteo，行情/摄像头另有数据源）。
   </div>
 
   <div class="card">
     <h3 style="margin-top:0">其它要点</h3>
     <ul>
-      <li><b>长按判定</b>：按住约 <b>0.6 秒</b>以上算"长按"。会议页里短按=翻页、长按=切换筛选/离开，靠这个时长区分。</li>
-      <li><b>首页的「我的下一场会议」</b>：黑底白字卡，自动从会议数据里挑出"你参加、且最近的一场"显示，并会在会议开始前 10 分钟响一声"滴滴"提醒（需连过 Wi-Fi 拉到数据）。它和会议页的「我的会议」筛选是两回事。</li>
+      <li><b>长按判定</b>：按住约 <b>0.6 秒</b>以上算"长按"。吉他页里右键长按=切和弦组、短按=拨弦，靠时长区分。</li>
       <li><b>屏无背光</b>：反射式屏幕靠环境光，暗处看不清是正常的，补点光即可。</li>
       <li><b>吉他页音效</b>：需要扬声器功放使能（GPIO46 已拉高），连不连 Wi-Fi 都能响。</li>
       <li><b>进入下载模式</b>：按住 BOOT 再按 PWR 重置，可进 ESP32 下载模式（烧录用）。注意：本说明里的"左键=BOOT(GPIO0)"正是这颗下载键。</li>
@@ -306,15 +276,14 @@
   <table>
     <tr><th>当前所在</th><th>操作</th><th>结果</th></tr>
     <tr><td>任意页</td><td>按 <b>PWR</b>（中）</td><td>硬重启 → 回到首页</td></tr>
-    <tr><td>首页(0)</td><td>短/长按 <b>左键</b></td><td>→ 会议页(1)</td></tr>
-    <tr><td>首页(0)</td><td>短按 <b>右键</b></td><td>→ 吉他页(2)</td></tr>
-    <tr><td>会议页(1)</td><td>短按 <b>左键</b></td><td>会议卡片下翻一屏（3 张）</td></tr>
-    <tr><td>会议页(1)</td><td>长按 <b>左键</b></td><td>切换「全部 / 我的会议」</td></tr>
-    <tr><td>会议页(1)</td><td>短按 <b>右键</b></td><td>会议卡片上翻一屏</td></tr>
-    <tr><td>会议页(1)</td><td>长按 <b>右键</b></td><td><b>离开会议页 → 回首页</b></td></tr>
-    <tr><td>吉他页(2)</td><td>短按 <b>左键</b></td><td>→ 首页(0)</td></tr>
-    <tr><td>吉他页(2)</td><td>短按 <b>右键</b></td><td>拨弦（扫弦+和弦+音效+功德+1）</td></tr>
-    <tr><td>吉他页(2)</td><td>长按 <b>右键</b></td><td>（无作用）</td></tr>
+    <tr><td>首页(0)</td><td>短/长按 <b>左键</b></td><td>→ 吉他页(1)</td></tr>
+    <tr><td>首页(0)</td><td>短按 <b>右键</b></td><td>→ 摄像头页(2)</td></tr>
+    <tr><td>吉他页(1)</td><td>短按 <b>左键</b></td><td>切换和弦（Cmaj7→Am7→Dm7→G7）</td></tr>
+    <tr><td>吉他页(1)</td><td>长按 <b>左键</b></td><td>→ 摄像头页(2)</td></tr>
+    <tr><td>吉他页(1)</td><td>短按 <b>右键</b></td><td>拨弦（扫弦+音效+功德+1）</td></tr>
+    <tr><td>吉他页(1)</td><td>长按 <b>右键</b></td><td>切换和弦练习组（OPEN / 7TH）</td></tr>
+    <tr><td>摄像头页(2)</td><td>短/长按 <b>左键</b></td><td>→ 首页(0)</td></tr>
+    <tr><td>摄像头页(2)</td><td>短按 <b>右键</b></td><td>→ 吉他页(1)</td></tr>
   </table>
   <p class="small">说明：左右以你手上实机为准——<b>左=BOOT(GPIO0)、右=KEY(GPIO18)</b>。若你的板子丝印左右相反，把表中"左/右"对调即可，功能不变。</p>
 
