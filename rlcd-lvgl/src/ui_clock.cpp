@@ -1,6 +1,6 @@
 #include "ui_clock.h"
 #include "ui.h"                 // cn_label()
-#include "ui_camera.h"         // ui_camera_thumb_init()：首页摄像头缩略预览
+#include "lunar.h"              // 公历 -> 农历（状态栏农历显示）
 #include "rtc_pcf85063.h"      // rtc_read_time / rtc_process_pending
 #include "lv_font_chinese_18.h"
 #include "lv_font_chinese_14.h"
@@ -9,8 +9,7 @@
 LV_FONT_DECLARE(lv_font_montserrat_12);
 #include "weather_icons.h"     // 单色天气图标（24x24 indexed-1bit）
 #include "brand_logo.h"        // 单色品牌标识（160x48 RGB565）
-#include "french_quotes.h"     // 法语短句（内置 100 句，SD 词库兜底）
-#include "french_lib.h"        // 法语词库抽象：SD 优先 + 内置兜底
+#include "french_lib.h"        // 法语词库抽象：SD 优先 + 内置兜底（法语学习卡用）
 #include <time.h>
 #include <string.h>
 #include <Arduino.h>
@@ -20,12 +19,19 @@ LV_FONT_DECLARE(lv_font_montserrat_12);
  * ============================================================ */
 static lv_obj_t *g_flip_digits[4] = {nullptr}; // 四个数字位：HHMM（普通时钟，无翻页动画层）
 static char g_flip_values[4] = {'\0', '\0', '\0', '\0'};
-static lv_obj_t *g_date_label= nullptr;   // 日期 + 星期
-static lv_obj_t *g_fr_quote  = nullptr;   // 顶部法语短句 label
-static uint8_t   g_fr_idx    = 0;         // 当前法语短句索引
-static int       g_fr_last_hour = -1;     // 上次轮换的"10分钟槽"标识(hour*6+min/10)
-static uint8_t   g_fr_show_cn = 0;        // 0=显示法语 1=显示中文（50s法+10s中循环）
-static uint32_t  g_fr_phase_last = 0;     // 上次 法/中 切换的时刻（epoch 秒）
+static lv_obj_t *g_date_label= nullptr;   // 日期 + 中文星期
+static lv_obj_t *g_lunar_label= nullptr;  // 农历日期（状态栏，替代原法语短句）
+static int g_lunar_ymd[3] = {0, 0, 0};    // 上次更新的农历年月日（仅变化时刷新 label）
+static const char *g_weekday_cn[] = {"周日", "周一", "周二", "周三", "周四", "周五", "周六"};
+
+/* ---- 法语学习卡（右下，替代摄像头缩略） ---- */
+static lv_obj_t *g_fr_card  = nullptr;    // 卡片容器
+static lv_obj_t *g_fr_t1    = nullptr;    // 句1 法语
+static lv_obj_t *g_fr_c1    = nullptr;    // 句1 中文
+static lv_obj_t *g_fr_t2    = nullptr;    // 句2 法语
+static lv_obj_t *g_fr_c2    = nullptr;    // 句2 中文
+static uint16_t  g_fr_idx1  = 0;          // 当前句1 索引
+static uint16_t  g_fr_idx2  = 0;          // 当前句2 索引（与句1 不重复）
 
 /* ---- 右上：股票指数行情卡（上证/沪深300/创业板指） ---- */
 /* ---- 右上：股票指数行情卡（弧形边框与底部卡一致，170x88 原 CAM 区域） ----
@@ -63,8 +69,6 @@ static lv_obj_t *g_wx_tomo_l2   = nullptr; // “20~28°”
 static lv_obj_t *g_wx_uptime    = nullptr; // 天气卡顶部“获取时间”label（两铆钉之间右对齐）
 static char      g_wx_uptime_buf[16] = {0}; // 缓存的获取时间字符串
 
-static const char *g_weekday_en[] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
-
 /* ============================================================
  *  天气数据缓存
  *  set 侧（网络任务）只写这份缓存，绝不触碰 LVGL 对象；
@@ -90,6 +94,11 @@ static const lv_coord_t FLIP_CARD_H = 64;   /* 缩小反色黑卡，让时钟居
 /* 定时器回调前向声明（定义见文件末尾） */
 static void clock_tick_cb(lv_timer_t *t);
 static void env_tick_cb(lv_timer_t *t);
+static void fr_learn_cb(lv_timer_t *t);       /* 法语学习卡 5 分钟换句 */
+
+/* 法语学习卡：随机两条法语+中文翻译（8-13 替代首页摄像头缩略） */
+static void build_fr_learn_card(lv_obj_t *parent, lv_coord_t x, lv_coord_t y,
+                                lv_coord_t w, lv_coord_t h);
 
 static lv_obj_t *make_rivet(lv_obj_t *parent)
 {
@@ -226,22 +235,19 @@ void ui_clock_init(lv_obj_t *parent, lv_obj_t *status_bar)
 {
     french_lib_init();   /* SD 词库优先，无卡/无文件用内置 100 句 */
 
-    /* ---- 日期并入全局状态栏：MM-DD + 英文星期缩写，紧贴 WiFi 图标 ---- */
+    /* ---- 日期并入全局状态栏：MM-DD + 中文星期，紧贴 WiFi 图标 ---- */
     g_date_label = lv_label_create(status_bar);
     lv_obj_set_style_text_font(g_date_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(g_date_label, lv_color_black(), 0);
-    lv_label_set_text(g_date_label, "--.-----");
+    lv_label_set_text(g_date_label, "--.-- ---");
     lv_obj_align(g_date_label, LV_ALIGN_LEFT_MID, 26, 0);
 
-    /* ---- 法语短句：紧贴日期右侧（留一个空格），每小时轮换（仅工作日 08-18 刷新）
-     * 用 chinese_14 字体：含 Latin-1 重音字符(Ààèéêù)，montserrat_14 只含 ASCII 会出方框 ---- */
-    g_fr_quote = lv_label_create(status_bar);
-    lv_obj_set_style_text_font(g_fr_quote, &lv_font_chinese_14, 0);
-    lv_obj_set_style_text_color(g_fr_quote, lv_color_black(), 0);
-    const char *fr0 = NULL, *cn0 = NULL;
-    french_lib_get(0, &fr0, &cn0);
-    lv_label_set_text(g_fr_quote, fr0 ? fr0 : kFrenchQuotes[0]);
-    lv_obj_align_to(g_fr_quote, g_date_label, LV_ALIGN_OUT_RIGHT_MID, 4, 0);
+    /* ---- 农历日期：紧贴日期右侧（"农历七月廿一"），8-13 替代原法语短句 ---- */
+    g_lunar_label = lv_label_create(status_bar);
+    lv_obj_set_style_text_font(g_lunar_label, &lv_font_chinese_14, 0);
+    lv_obj_set_style_text_color(g_lunar_label, lv_color_black(), 0);
+    lv_label_set_text(g_lunar_label, "");
+    lv_obj_align_to(g_lunar_label, g_date_label, LV_ALIGN_OUT_RIGHT_MID, 4, 0);
 
     /* 页面从状态栏下方立即开始，释放原顶部题签占用的 26px。 */
     lv_obj_t *rule = lv_obj_create(parent);
@@ -429,12 +435,13 @@ void ui_clock_init(lv_obj_t *parent, lv_obj_t *status_bar)
 
     add_corner_rivets(env, 3);
 
-    /* ---- 底部右：摄像头缩略预览（原 X 帖文卡位置 196,116 200x160，改为 CAM 预览） ---- */
-    ui_camera_thumb_init(parent, 196, 122, 200, 150);
+    /* ---- 底部右：法语学习卡（原摄像头缩略位置 196,122 200x150，8-13 起改为法语学习） ---- */
+    build_fr_learn_card(parent, 196, 122, 200, 150);
 
     /* 定时器（运行于 LVGL 任务内，独占 I²C 总线） */
     lv_timer_create(clock_tick_cb, 1000, NULL);
     lv_timer_create(env_tick_cb,   5000, NULL);
+    lv_timer_create(fr_learn_cb, 300000, NULL);   /* 5 分钟切换两条法语 */
 }
 
 /* ============================================================
@@ -601,58 +608,34 @@ static void clock_tick_cb(lv_timer_t *t)
     set_flip_digit(3, mm[1]);
 
     char db[32];
-    snprintf(db, sizeof(db), "%02d-%02d%s",
+    snprintf(db, sizeof(db), "%02d-%02d %s",
              tm.tm_mon + 1, tm.tm_mday,
-             g_weekday_en[tm.tm_wday % 7]);
+             g_weekday_cn[tm.tm_wday % 7]);
     lv_label_set_text(g_date_label, db);
 
-    /* 日期文本变化后宽度可能改变：重新对齐法语短句，避免与星期缩写重叠
-     * （align_to 只在调用时生效一次，必须在每次日期更新后重新执行） */
-    if (g_fr_quote) {
-        lv_obj_align_to(g_fr_quote, g_date_label, LV_ALIGN_OUT_RIGHT_MID, 4, 0);
+    /* 日期文本宽度变化后重新对齐农历 label（align_to 仅调用时生效一次） */
+    if (g_lunar_label) {
+        lv_obj_align_to(g_lunar_label, g_date_label, LV_ALIGN_OUT_RIGHT_MID, 4, 0);
     }
 
-    /* ---- 法语短句轮换：每 10 分钟一句，期间 50s 法语 + 10s 中文循环 ----
-     * 用 hour*6+min/10 作为"10 分钟槽"：槽变化即切下一句（随机），并重置为法语。
-     * 同槽内按秒计数：法语 50s → 中文 10s → 法语 50s → …（整分钟对齐）。
-     * 仅工作日(周一~周五) 08:00-18:00 刷新。 */
-    {
-        int slot = tm.tm_hour * 6 + tm.tm_min / 10;
-        bool workday = (tm.tm_wday >= 1 && tm.tm_wday <= 5);
-        bool worktime = (tm.tm_hour >= 8 && tm.tm_hour < 18);
-        time_t now_epoch = time(nullptr);   /* NTP 同步后有效；与 RTC 显示同一时间源 */
-
-        if (g_fr_quote && workday && worktime) {
-            uint16_t fr_total = french_lib_count();
-            if (slot != g_fr_last_hour) {
-                /* 换新句：随机抽取（避免与上一句相同），显示法语 */
-                g_fr_last_hour = slot;
-                uint16_t next = (uint16_t)(esp_random() % fr_total);
-                if (fr_total > 1 && next == g_fr_idx) {
-                    next = (uint16_t)((next + 1) % fr_total);
-                }
-                g_fr_idx = next;
-                g_fr_show_cn = 0;
-                g_fr_phase_last = now_epoch;
-                const char *fr = NULL, *cn = NULL;
-                french_lib_get(g_fr_idx, &fr, &cn);
-                lv_label_set_text(g_fr_quote, fr ? fr : kFrenchQuotes[g_fr_idx]);
-            } else {
-                /* 同槽：50s 法语 + 10s 中文循环（整分钟从法语开始） */
-                uint32_t elapsed = (uint32_t)(now_epoch - g_fr_phase_last);
-                const char *fr = NULL, *cn = NULL;
-                french_lib_get(g_fr_idx, &fr, &cn);
-                if (g_fr_show_cn == 0 && elapsed >= 50) {
-                    g_fr_show_cn = 1;
-                    g_fr_phase_last = now_epoch;
-                    lv_label_set_text(g_fr_quote, cn ? cn : kFrenchTranslations[g_fr_idx]);
-                } else if (g_fr_show_cn == 1 && elapsed >= 10) {
-                    g_fr_show_cn = 0;
-                    g_fr_phase_last = now_epoch;
-                    lv_label_set_text(g_fr_quote, fr ? fr : kFrenchQuotes[g_fr_idx]);
-                }
-            }
+    /* ---- 农历日期：仅公历日期变化时刷新（"农历"前缀 + 月日，如"农历七月廿一"） ---- */
+    int gy = tm.tm_year + 1900, gm = tm.tm_mon + 1, gd = tm.tm_mday;
+    if (g_lunar_label && (gy != g_lunar_ymd[0] || gm != g_lunar_ymd[1] || gd != g_lunar_ymd[2])) {
+        int ly = 0, lm = 0, ld = 0;
+        bool leap = false;
+        char lbuf[16];
+        if (lunar_from_solar(gy, gm, gd, &ly, &lm, &ld, &leap)) {
+            char date_cn[10];
+            lunar_date_cn(lm, ld, leap, date_cn, sizeof(date_cn));
+            snprintf(lbuf, sizeof(lbuf), "农历%s", date_cn);
+        } else {
+            snprintf(lbuf, sizeof(lbuf), "");
         }
+        lv_label_set_text(g_lunar_label, lbuf);
+        g_lunar_ymd[0] = gy;
+        g_lunar_ymd[1] = gm;
+        g_lunar_ymd[2] = gd;
+        lv_obj_align_to(g_lunar_label, g_date_label, LV_ALIGN_OUT_RIGHT_MID, 4, 0);
     }
 }
 
@@ -672,4 +655,90 @@ static void env_tick_cb(lv_timer_t *t)
         lv_label_set_text(g_env_humi, buf);
         ui_update_ambient(temp, humi);   /* 同步第三页（环境页） */
     }
+}
+
+/* ============================================================
+ *  法语学习卡（右下，替代原摄像头缩略）
+ *  - 每次随机取两条不重复的法语句子（法文 + 中文翻译）
+ *  - 5 分钟定时器（fr_learn_cb）重新随机
+ *  - 词库：french_lib（SD /sdcard/french.txt 优先，内置 100 句兜底）
+ * ============================================================ */
+static void fr_learn_pick(void)
+{
+    if (!g_fr_card) return;
+    uint16_t total = french_lib_count();
+    if (total < 2) return;
+
+    /* 两条不重复的随机索引：i2 在 [0,total-1) 取值，≥i1 时 +1 避开 i1 */
+    uint16_t i1 = (uint16_t)(esp_random() % total);
+    uint16_t i2 = (uint16_t)(esp_random() % (total - 1));
+    if (i2 >= i1) i2++;
+    g_fr_idx1 = i1;
+    g_fr_idx2 = i2;
+
+    const char *fr = NULL, *cn = NULL;
+    french_lib_get(i1, &fr, &cn);
+    lv_label_set_text(g_fr_t1, fr ? fr : "");
+    lv_label_set_text(g_fr_c1, cn ? cn : "");
+    french_lib_get(i2, &fr, &cn);
+    lv_label_set_text(g_fr_t2, fr ? fr : "");
+    lv_label_set_text(g_fr_c2, cn ? cn : "");
+}
+
+static void fr_learn_cb(lv_timer_t *t)
+{
+    (void)t;
+    fr_learn_pick();
+}
+
+/* 构建卡片：标题"法语学习" + 两条（法文可换行两行 + 中文单行） */
+static void build_fr_learn_card(lv_obj_t *parent, lv_coord_t x, lv_coord_t y,
+                                lv_coord_t w, lv_coord_t h)
+{
+    g_fr_card = lv_obj_create(parent);
+    lv_obj_remove_style_all(g_fr_card);
+    lv_obj_set_size(g_fr_card, w, h);
+    lv_obj_set_pos(g_fr_card, x, y);
+    lv_obj_set_style_bg_opa(g_fr_card, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_color(g_fr_card, lv_color_black(), 0);
+    lv_obj_set_style_border_width(g_fr_card, 2, 0);
+    lv_obj_set_style_radius(g_fr_card, 10, 0);
+    lv_obj_set_style_pad_all(g_fr_card, 6, 0);
+    lv_obj_clear_flag(g_fr_card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_coord_t iw = w - 12;   /* 内容宽（去掉 2px 边框 + 6px pad*2） */
+
+    lv_obj_t *title = cn_label(g_fr_card, "法语学习");
+    lv_obj_set_style_text_font(title, &lv_font_chinese_14, 0);
+    lv_obj_set_pos(title, 0, 0);
+
+    g_fr_t1 = cn_label(g_fr_card, "");
+    lv_obj_set_style_text_font(g_fr_t1, &lv_font_chinese_14, 0);
+    lv_obj_set_width(g_fr_t1, iw);
+    lv_obj_set_height(g_fr_t1, 38);                     /* 法语可换行两行 */
+    lv_label_set_long_mode(g_fr_t1, LV_LABEL_LONG_WRAP);
+    lv_obj_set_pos(g_fr_t1, 0, 20);
+
+    g_fr_c1 = cn_label(g_fr_card, "");
+    lv_obj_set_style_text_font(g_fr_c1, &lv_font_chinese_14, 0);
+    lv_obj_set_style_text_opa(g_fr_c1, LV_OPA_80, 0);
+    lv_obj_set_width(g_fr_c1, iw);
+    lv_label_set_long_mode(g_fr_c1, LV_LABEL_LONG_DOT);
+    lv_obj_set_pos(g_fr_c1, 0, 60);
+
+    g_fr_t2 = cn_label(g_fr_card, "");
+    lv_obj_set_style_text_font(g_fr_t2, &lv_font_chinese_14, 0);
+    lv_obj_set_width(g_fr_t2, iw);
+    lv_obj_set_height(g_fr_t2, 38);
+    lv_label_set_long_mode(g_fr_t2, LV_LABEL_LONG_WRAP);
+    lv_obj_set_pos(g_fr_t2, 0, 82);
+
+    g_fr_c2 = cn_label(g_fr_card, "");
+    lv_obj_set_style_text_font(g_fr_c2, &lv_font_chinese_14, 0);
+    lv_obj_set_style_text_opa(g_fr_c2, LV_OPA_80, 0);
+    lv_obj_set_width(g_fr_c2, iw);
+    lv_label_set_long_mode(g_fr_c2, LV_LABEL_LONG_DOT);
+    lv_obj_set_pos(g_fr_c2, 0, 122);
+
+    fr_learn_pick();
 }
