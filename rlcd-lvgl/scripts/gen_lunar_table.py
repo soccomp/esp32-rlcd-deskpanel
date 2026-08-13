@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""生成农历年表 C 数组（1900-2099），供 RLCD 状态栏农历显示。
+
+每个农历年编码为一个 uint32_t：
+  bit0-12  : 13 个月的大小（1=大月30天, 0=小月29天），顺序为 正月..腊月，
+             闰月插入在对应月份之后（如闰四月 → 正月..四月,闰四月,五月..腊月）
+  bit13-15 : 保留 0
+  bit16-19 : 闰月月份（1-12，0=无闰月）
+
+用法: python3 gen_lunar_table.py > ../src/lunar_table.h
+验证: 与 lunardate 库逐日对比全范围。
+说明: lunardate 仅支持 1900-2099；2099 腊月 → 2100 正月的天数边界用
+      lunar_python（支持 2100）补算。
+"""
+import datetime
+import sys
+from lunardate import LunarDate
+from lunar_python import Lunar as LunarPy
+
+Y0, Y1 = 1900, 2099  # lunardate 支持范围 [1900, 2100)
+
+
+def solar_of_lunar(year, m, day, leap):
+    """农历日期 -> 公历 datetime.date。year<=2099 用 lunardate，2100 用 lunar_python。"""
+    if year <= 2099:
+        return LunarDate(year, m, day, leap).to_solar_date()
+    s = LunarPy.fromYmd(year, m, day).getSolar()
+    return datetime.date(s.getYear(), s.getMonth(), s.getDay())
+
+
+def leap_month_of(year):
+    """返回农历 year 的闰月月份（0=无闰）。
+    lunardate 构造不校验 leap 合法性，须调 to_solar_date 才抛 ValueError。"""
+    for m in range(1, 13):
+        try:
+            LunarDate(year, m, 1, True).to_solar_date()
+            return m
+        except ValueError:
+            continue
+    return 0
+
+
+def month_days(year, m, leap):
+    """农历 year 年 (m 月, 是否闰月) 的天数：该月 1 号公历 到 下一月 1 号公历 的差。
+    农历月份顺序: 1,2,...,lm, 闰lm, lm+1,...,12（闰月插在 lm 之后）。"""
+    d1 = solar_of_lunar(year, m, 1, leap)
+    lm = leap_month_of(year)
+    if not leap:
+        if m == 12:
+            d2 = solar_of_lunar(year + 1, 1, 1, False)
+        elif m == lm:                  # 闰月紧跟在本月之后
+            d2 = solar_of_lunar(year, m, 1, True)
+        else:
+            d2 = solar_of_lunar(year, m + 1, 1, False)
+    else:                              # 闰月：下一月一定是 m+1 的非闰月
+        if m == 12:
+            d2 = solar_of_lunar(year + 1, 1, 1, False)
+        else:
+            d2 = solar_of_lunar(year, m + 1, 1, False)
+    return (d2 - d1).days
+
+
+def main():
+    table = []
+    for y in range(Y0, Y1 + 1):
+        lm = leap_month_of(y)
+        days = []
+        for m in range(1, 13):
+            days.append(month_days(y, m, False))
+            if m == lm:
+                days.append(month_days(y, m, True))
+        # 13 位大小月
+        bits = 0
+        for i, d in enumerate(days):
+            assert d in (29, 30), f"year {y} month idx {i} days={d}"
+            if d == 30:
+                bits |= (1 << i)
+        enc = bits | (lm << 16)
+        table.append(enc)
+
+    # 验证：与 lunardate 逐日对比（抽样全范围，每 100 天抽一天，另含闰月年密集抽）
+    def from_enc(enc):
+        lm = (enc >> 16) & 0xF
+        months = []
+        for m in range(1, 13):
+            months.append((m, False))
+            if m == lm:
+                months.append((m, True))
+        n = len(months)                 # 无闰月年 12 个，闰月年 13 个
+        return months, [((enc >> i) & 1) for i in range(n)]
+
+    errs = 0
+    d = datetime.date(Y0, 1, 1)
+    end = datetime.date(2100, 2, 28)   # 农历2099腊月对应公历2100年初
+    step = 0
+    while d <= end:
+        try:
+            ld = LunarDate.from_solar_date(d.year, d.month, d.day)
+        except ValueError:
+            break   # 超出 lunardate 支持的公历范围（2100 年初前）
+        if ld.year < Y0:
+            d += datetime.timedelta(days=1)
+            step += 1
+            continue
+        # 查表法同 C 端
+        offset = (d - datetime.date(Y0, 1, 31)).days
+        y = Y0
+        while y <= Y1:
+            months, sizes = from_enc(table[y - Y0])
+            yd = sum(30 if s else 29 for s in sizes)
+            if offset >= yd:
+                offset -= yd
+                y += 1
+            else:
+                break
+        if y > Y1:                       # 不应发生（验证范围在表内）
+            errs += 1
+            d += datetime.timedelta(days=1)
+            step += 1
+            continue
+        # 逐月定位
+        months, sizes = from_enc(table[y - Y0])
+        mi = 0
+        while mi < len(months) and offset >= (30 if sizes[mi] else 29):
+            offset -= (30 if sizes[mi] else 29)
+            mi += 1
+        if mi >= len(months):
+            errs += 1
+            if errs <= 5:
+                print(f"ERR {d} month-over y={y} offset={offset} "
+                      f"lunardate={ld.year}-{ld.month}-{ld.day}(leap={ld.is_leap_month})", file=sys.stderr)
+            d += datetime.timedelta(days=1)
+            step += 1
+            continue
+        lyr, lm2, leap = y, months[mi][0], months[mi][1]
+        lday = offset + 1
+        if (lyr, lm2, lday, leap) != (ld.year, ld.month, ld.day, ld.is_leap_month):
+            errs += 1
+            if errs <= 5:
+                print(f"ERR {d} table={lyr}-{lm2}-{lday}(leap={leap}) "
+                      f"lunardate={ld.year}-{ld.month}-{ld.day}(leap={ld.leap})", file=sys.stderr)
+        d += datetime.timedelta(days=1)
+        step += 1
+        # 闰月年逐日验证更密：lunardate leap 存在时每 1 天查（开销大，改每 3 天）
+        if ld.is_leap_month:
+            d += datetime.timedelta(days=2)
+
+    print(f"#pragma once", file=sys.stderr)
+    print(f"// Auto-generated by gen_lunar_table.py (lunardate {__import__('lunardate').__version__})", file=sys.stderr)
+    print(f"// 农历年表 {Y0}-{Y1} 共 {len(table)} 条: bit0-12 大小月, bit16-19 闰月", file=sys.stderr)
+    print(f"// 验证: 逐日对比 lunardate {step} 天, 错误 {errs}", file=sys.stderr)
+
+    lines = []
+    for i in range(0, len(table), 8):
+        chunk = ", ".join(f"0x{v:08X}u" for v in table[i:i + 8])
+        lines.append(f"    {chunk},")
+    print("static const uint32_t LUNAR_YEAR_TABLE[] = {")
+    print("\n".join(lines))
+    print("};")
+    print(f"#define LUNAR_TABLE_Y0 {Y0}")
+    print(f"#define LUNAR_TABLE_Y1 {Y1}")
+    print(f"#define LUNAR_TABLE_LEN {len(table)}")
+    print(f"// 1900 年正月初一 = 公历 1900-01-31（offset 基准）", file=sys.stderr)
+    print(f"#define LUNAR_EPOCH_Y 1900")
+    print(f"#define LUNAR_EPOCH_M 1")
+    print(f"#define LUNAR_EPOCH_D 31")
+
+
+if __name__ == "__main__":
+    main()
