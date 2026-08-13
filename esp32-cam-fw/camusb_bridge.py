@@ -8,7 +8,7 @@
 RLCD-004 新增「本地 hub」（127.0.0.1:8770）：两个串口只能被一个进程独占，
 因此手势识别程序不直接开串口，而是接本 hub：
   hub -> 客户端：每帧原样下发（同一套帧协议，客户端可复用解析器）
-  客户端 -> hub：ASCII 命令行（白名单 PAGE:HOME|PAGE:MEETING|PAGE:GUITAR），
+  客户端 -> hub：ASCII 命令行（白名单 PAGE:HOME|PAGE:GUITAR|PAGE:CAMERA），
                  由本脚本写入 RLCD USB-CDC，与视频帧共用同一条通道。
 视频转发逻辑、帧协议、CRC 均未改动；无客户端连接时行为与改造前完全一致。
 
@@ -45,11 +45,25 @@ RETRY_WAIT = 3.0        # 端口缺失/异常后的重试间隔（秒）
 REPORT_EVERY = 5.0      # 帧率日志间隔（秒）
 
 HUB_HOST, HUB_PORT = "127.0.0.1", 8770  # 本地帧分流 / 命令回注
-ALLOWED_CMDS = ("PAGE:HOME", "PAGE:MEETING", "PAGE:GUITAR")
+# 8-13：会议页已移除，PAGE 白名单改为 HOME / GUITAR / CAMERA（原 MEETING 删除）
+ALLOWED_CMDS = ("PAGE:HOME", "PAGE:GUITAR", "PAGE:CAMERA")
 
 
 def log(msg):
     print(f"[bridge {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def write_all(port, data, chunk=4096):
+    """8-13 修复：pyserial 大包（15KB 视频帧）可能部分写入（返回 < len）。
+    不检查返回值会导致帧被截断 -> RLCD 解析不完整 -> 收不到帧。
+    循环写直到全部写完（小包命令同样安全）。"""
+    view = memoryview(data)
+    while view:
+        n = port.write(view)
+        if n <= 0:
+            break
+        view = view[n:]
+    port.flush()
 
 
 def _cu(dev):
@@ -219,6 +233,24 @@ def pump(cam, rlcd, hub):
     last_report = time.time()
 
     while True:
+        # 8-13 修复：命令写在每轮开头（读帧前）——此时上一视频帧已处理完
+        # 约 0.4s，RLCD 状态机必处空闲（S_H0），命令帧头不会被视频帧体吞掉。
+        # （原先写在视频帧之后，命令帧头常撞 S_BODY，注入实测仅 ~50% ACK；
+        #  加 64B 填充后 83%，仍偶发撞帧中段。挪到帧间彻底解决。）
+        while True:
+            try:
+                cmd = hub.commands.get_nowait()
+            except queue.Empty:
+                break
+            body = b"CMD:" + cmd.encode("ascii")
+            crc_c = (len(body) & 0xFFFF)
+            for b in body:
+                crc_c = (crc_c + b) & 0xFFFF
+            pkt = HEAD + len(body).to_bytes(2, "big") + body + crc_c.to_bytes(2, "big")
+            rlcd.write(b"\x00" * 64)   # 双保险：即使状态机不在 S_H0，填充冲刷复位
+            write_all(rlcd, pkt)
+            log(f"cmd -> RLCD: {cmd}")
+
         chunk = cam.read(65536)
         if chunk:
             buf.extend(chunk)
@@ -250,22 +282,11 @@ def pump(cam, rlcd, hub):
 
             if crc_c == crc_r:
                 packet = HEAD + flen.to_bytes(2, "big") + frame + crc_r.to_bytes(2, "big")
-                rlcd.write(packet)
-                rlcd.flush()
+                write_all(rlcd, packet)
                 hub.publish(packet)
                 ok += 1
             else:
                 bad += 1
-
-        # 订阅者回传的页面命令：与视频帧共用 USB-CDC，写在帧边界之间
-        while True:
-            try:
-                cmd = hub.commands.get_nowait()
-            except queue.Empty:
-                break
-            rlcd.write(cmd.encode("ascii") + b"\n")
-            rlcd.flush()
-            log(f"cmd -> RLCD: {cmd}")
 
         # RLCD-004.2：读取 RLCD 的 USB-CDC TX，把 ``ACK:PAGE:X`` 回执转发给 hub 客户端
         rlcd_wait = rlcd.in_waiting
@@ -273,8 +294,8 @@ def pump(cam, rlcd, hub):
             chunk = rlcd.read(rlcd_wait)
             if chunk:
                 rlcd_line_buf.extend(chunk)
-                if len(rlcd_line_buf) > 512:       # 安全：丢弃异常长行
-                    rlcd_line_buf = rlcd_line_buf[-256:]
+                if len(rlcd_line_buf) > 16384:      # 崩溃输出（panic/Guru/Backtrace）可达数 KB，
+                    rlcd_line_buf = rlcd_line_buf[-8192:]   # 保留足够缓冲以免截掉 panic 头
                 while b"\n" in rlcd_line_buf:
                     line, rlcd_line_buf = rlcd_line_buf.split(b"\n", 1)
                     s = line.strip().decode("ascii", "ignore")
@@ -282,6 +303,10 @@ def pump(cam, rlcd, hub):
                     # 形成 ESP32 RX(收到) / UI SWITCH(切页) 的可见证据链；不转发给客户端
                     if s.startswith("[cmd]") or s.startswith("[cam]"):
                         log(f"rlcd: {s}")
+                    elif s:
+                        # 8-12：记录 RLCD 全部其它输出（panic/Guru Meditation/assert
+                        # 等崩溃信息不以 [cmd]/[cam] 开头），用于定位芯片复位根因
+                        log(f"rlcd!: {s}")
                     # ACK 提取：RLCD 的 Serial.printf 偶发与其它日志粘连/换行丢失
                     # （如 "[cmd] PAGE:GUITAR -> paACK:PAGE:GUITAR"），行首匹配会漏掉，
                     # 因此改为在整行内搜索 "ACK:PAGE:" 子串，粘连也能提取转发。
