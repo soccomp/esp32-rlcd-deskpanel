@@ -235,9 +235,10 @@ void ui_clock_init(lv_obj_t *parent, lv_obj_t *status_bar)
 {
     french_lib_init();   /* SD 词库优先，无卡/无文件用内置 100 句 */
 
-    /* ---- 日期并入全局状态栏：MM-DD + 中文星期，紧贴 WiFi 图标 ---- */
+    /* ---- 日期并入全局状态栏：MM-DD + 中文星期，紧贴 WiFi 图标 ----
+     * 用 chinese_14：含中文星期（周四）与 ASCII，montserrat_14 无中文会出方框 ---- */
     g_date_label = lv_label_create(status_bar);
-    lv_obj_set_style_text_font(g_date_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(g_date_label, &lv_font_chinese_14, 0);
     lv_obj_set_style_text_color(g_date_label, lv_color_black(), 0);
     lv_label_set_text(g_date_label, "--.-- ---");
     lv_obj_align(g_date_label, LV_ALIGN_LEFT_MID, 26, 0);
@@ -623,9 +624,9 @@ static void clock_tick_cb(lv_timer_t *t)
     if (g_lunar_label && (gy != g_lunar_ymd[0] || gm != g_lunar_ymd[1] || gd != g_lunar_ymd[2])) {
         int ly = 0, lm = 0, ld = 0;
         bool leap = false;
-        char lbuf[16];
+        char date_cn[24];                       /* 最长"闰腊月三十"=6字*3B+1=19B */
+        char lbuf[32];                          /* "农历"前缀 + date_cn */
         if (lunar_from_solar(gy, gm, gd, &ly, &lm, &ld, &leap)) {
-            char date_cn[10];
             lunar_date_cn(lm, ld, leap, date_cn, sizeof(date_cn));
             snprintf(lbuf, sizeof(lbuf), "农历%s", date_cn);
         } else {
@@ -691,7 +692,7 @@ static void fr_learn_cb(lv_timer_t *t)
     fr_learn_pick();
 }
 
-/* 构建卡片：标题"法语学习" + 两条（法文可换行两行 + 中文单行） */
+/* 构建卡片：两条（法文可换行两行 + 中文单行），无标题（8-13 用户要求去掉"法语学习"） */
 static void build_fr_learn_card(lv_obj_t *parent, lv_coord_t x, lv_coord_t y,
                                 lv_coord_t w, lv_coord_t h)
 {
@@ -708,37 +709,33 @@ static void build_fr_learn_card(lv_obj_t *parent, lv_coord_t x, lv_coord_t y,
 
     lv_coord_t iw = w - 12;   /* 内容宽（去掉 2px 边框 + 6px pad*2） */
 
-    lv_obj_t *title = cn_label(g_fr_card, "法语学习");
-    lv_obj_set_style_text_font(title, &lv_font_chinese_14, 0);
-    lv_obj_set_pos(title, 0, 0);
-
     g_fr_t1 = cn_label(g_fr_card, "");
     lv_obj_set_style_text_font(g_fr_t1, &lv_font_chinese_14, 0);
     lv_obj_set_width(g_fr_t1, iw);
     lv_obj_set_height(g_fr_t1, 38);                     /* 法语可换行两行 */
     lv_label_set_long_mode(g_fr_t1, LV_LABEL_LONG_WRAP);
-    lv_obj_set_pos(g_fr_t1, 0, 20);
+    lv_obj_set_pos(g_fr_t1, 0, 4);
 
     g_fr_c1 = cn_label(g_fr_card, "");
     lv_obj_set_style_text_font(g_fr_c1, &lv_font_chinese_14, 0);
     lv_obj_set_style_text_opa(g_fr_c1, LV_OPA_80, 0);
     lv_obj_set_width(g_fr_c1, iw);
     lv_label_set_long_mode(g_fr_c1, LV_LABEL_LONG_DOT);
-    lv_obj_set_pos(g_fr_c1, 0, 60);
+    lv_obj_set_pos(g_fr_c1, 0, 44);
 
     g_fr_t2 = cn_label(g_fr_card, "");
     lv_obj_set_style_text_font(g_fr_t2, &lv_font_chinese_14, 0);
     lv_obj_set_width(g_fr_t2, iw);
     lv_obj_set_height(g_fr_t2, 38);
     lv_label_set_long_mode(g_fr_t2, LV_LABEL_LONG_WRAP);
-    lv_obj_set_pos(g_fr_t2, 0, 82);
+    lv_obj_set_pos(g_fr_t2, 0, 66);
 
     g_fr_c2 = cn_label(g_fr_card, "");
     lv_obj_set_style_text_font(g_fr_c2, &lv_font_chinese_14, 0);
     lv_obj_set_style_text_opa(g_fr_c2, LV_OPA_80, 0);
     lv_obj_set_width(g_fr_c2, iw);
     lv_label_set_long_mode(g_fr_c2, LV_LABEL_LONG_DOT);
-    lv_obj_set_pos(g_fr_c2, 0, 122);
+    lv_obj_set_pos(g_fr_c2, 0, 106);
 
     fr_learn_pick();
 }
