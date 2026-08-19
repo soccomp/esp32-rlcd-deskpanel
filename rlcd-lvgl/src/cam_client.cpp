@@ -19,6 +19,10 @@
 #include <esp_system.h>
 #include <stdarg.h>
 #include <string.h>
+#include <lwip/sockets.h>       /* socket()/close()：net_diag 探测剩余 fd 配额 */
+/* main.cpp 提供：彻底关 radio 再重连（数据面死而关联在时唯一有效的自愈手段） */
+extern void wifi_hard_restart(void);
+#include <lwip/priv/tcp_priv.h> /* tcp_active_pcbs / tcp_tw_pcbs 等全局链表：net_diag 统计 PCB 占用 */
 
 namespace {
 
@@ -42,6 +46,14 @@ volatile uint8_t  g_write_idx = 1;
 volatile uint32_t g_seq       = 0;
 volatile uint32_t g_pub_ms    = 0;   /* 最近成功发布时刻（新鲜度） */
 bool      g_ready = false;
+
+/* 方案B：页面切换请求/ACK 状态（移出 CAM_USB_INPUT 守卫，WiFi 直连模式也用）。
+ * g_page_req：命令任务登记、main loop 取走执行（取走即清 -1）。
+ * g_ack_pending：main loop 切页确认后置位，cmd_server_task 在同一 TCP 连接上回 ACK。 */
+volatile int8_t g_page_req   = -1;    /* 待处理页面请求（-1 无） */
+volatile int8_t g_ack_pending = -1;   /* 待回 ACK 的页（-1 无） */
+WiFiServer g_cmd_server(8771);       /* M1 手势程序经 WiFi 下发 PAGE 命令 */
+WiFiClient g_cmd_client;              /* 当前连上的手势客户端（用于回 ACK） */
 
 #ifdef CAM_USB_INPUT
 /* ---- RLCD-004.2：RX 消费与解码解耦（S3 双核） ----
@@ -100,7 +112,6 @@ volatile uint32_t g_diag_cnt = 0;    /* 发布计数（每 N 帧打印一次） 
 constexpr uint8_t CMD_MAX = 16;
 char     g_cmd_buf[CMD_MAX + 1];
 uint8_t  g_cmd_len = 0;
-volatile int8_t g_page_req = -1;      /* -1 = 无待处理请求 */
 
 void cmd_feed(uint8_t c)
 {
@@ -166,26 +177,17 @@ bool tjpg_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitmap)
     return true;   /* 继续解码 */
 }
 
-/* ★ 摄像头帧走 Mac 后端代理（/api/camframe）
- * 背景：某些企业 AP（如 BTWIFI6 系列）对 ESP32 出站 TCP 做 per-device RST，
- * RLCD→摄像头直连（esp32cam:80）不稳定；Mac 是电脑不受限。后端后台线程
- * 每 500ms 抓摄像头 /capture 缓存，RLCD 从这里拉帧——RLCD→Mac 与 Mac→
- * 摄像头两条路径都稳定，彻底绕开 RST。
- * 主机解析：mDNS 查 Mac 主机名（缓存 5min），失败回退固定 IP。
- * 真实主机名/IP 在本地 src/local_config.h（被 .gitignore 忽略，不提交 GitHub）。 */
-#if __has_include("local_config.h")
-#include "local_config.h"
-#endif
-#ifndef CAM_PROXY_HOST
-#define CAM_PROXY_HOST "YOUR_MAC_HOSTNAME"    /* Mac mDNS 主机名（无 .local） */
-#endif
-#ifndef CAM_PROXY_FALLBACK
-#define CAM_PROXY_FALLBACK "YOUR_MAC_IP"       /* Mac 局域网 IP */
-#endif
-static const char g_cam_proxy_host[]     = CAM_PROXY_HOST;      /* Mac mDNS 主机名（无 .local） */
-static const char g_cam_proxy_fallback[] = CAM_PROXY_FALLBACK;  /* Mac 局域网 IP */
-static const int  CAM_PROXY_PORT         = 8100;
-static const char CAM_PROXY_PATH[]       = "/api/camframe";
+/* ★ 方案B：摄像头帧直连 camera（不再经 Mac 后端代理）
+ * 背景：原担心 RLCD→camera 直连会被 BTWIFI6 的 per-device RST 搞死才绕 Mac；
+ * 但 RST 是**出网**方向，RLCD→camera 是同 AP 下的 LAN 本地 TCP，不受影响；
+ * 且 802.11ax→n 切换已根治 RST。camera 稳定服务 /capture（mDNS "esp32cam"，端口
+ * 80），AP 侧 MAC 绑定给 camera 保留 192.168.100.199。RLCD 直接拉帧即可。 */
+static const char g_cam_host[]     = "esp32cam";          /* camera mDNS（无 .local，回退用） */
+static const char g_cam_proxy[]    = "192.168.100.198";   /* M1 Mac：finger_page_control 本地帧代理(:8780) */
+static const int  CAM_PROXY_PORT   = 8780;
+static const char g_cam_fallback[] = "192.168.100.199";   /* 摄像头（M1 宕机时 RLCD 直连，独占不挤） */
+static const int  CAM_PORT         = 80;
+static const char CAM_PATH[]       = "/capture";
 
 String resolve_cam_url(void)
 {
@@ -203,26 +205,41 @@ String resolve_cam_url(void)
         return g_url;
     }
 
+    /* ★ 方案B+：优先从 M1 本地代理(:8780)取帧。M1 是摄像头唯一外部消费者
+     * （ESP32-CAM 单线程 HTTP server 只扛得住一个），拉到帧后在本地代理喂 RLCD，
+     * 摄像头不再被 RLCD+M1 双拉挤爆（实测双消费者 60% 超时）。 */
+    WiFiClient t;
+    if (t.connect(g_cam_proxy, CAM_PROXY_PORT)) {
+        t.stop();
+        g_url = String("http://") + g_cam_proxy + ":" + String(CAM_PROXY_PORT) + CAM_PATH;
+        g_mdns_ok = true;
+        g_mdns_ms = now;
+        cam_client_log("[cam] use M1 proxy %s:%d\n", g_cam_proxy, CAM_PROXY_PORT);
+        return g_url;
+    }
+
+    /* 回退：摄像头直连（mDNS 优先，失败用 AP 保留 IP）。
+     * M1 宕机时走这里——此时无手势，RLCD 独占摄像头也能显示。 */
     if (g_mdns_init_done) {
-        cam_client_log("[cam] mDNS resolving \"%s\" ...\n", g_cam_proxy_host);
-        IPAddress ip = MDNS.queryHost(g_cam_proxy_host, 3000);
+        cam_client_log("[cam] mDNS resolving \"%s\" ...\n", g_cam_host);
+        IPAddress ip = MDNS.queryHost(g_cam_host, 3000);
         if (ip != INADDR_NONE && ip != IPAddress(0, 0, 0, 0)) {
-            g_url = "http://" + ip.toString() + ":" + String(CAM_PROXY_PORT) + CAM_PROXY_PATH;
+            g_url = "http://" + ip.toString() + ":" + String(CAM_PORT) + CAM_PATH;
             g_mdns_ok = true;
             g_mdns_ms = now;
-            cam_client_log("[cam] proxy resolved: %s -> %s\n",
-                          g_cam_proxy_host, ip.toString().c_str());
+            cam_client_log("[cam] camera resolved: %s -> %s\n",
+                          g_cam_host, ip.toString().c_str());
             return g_url;
         }
         g_mdns_ok = false;
-        Serial.println("[cam] proxy mDNS resolution failed");
+        Serial.println("[cam] camera mDNS resolution failed");
     }
 
-    /* mDNS 失败 -> 固定 IP 兜底 */
-    g_url = String("http://") + g_cam_proxy_fallback + ":" + String(CAM_PROXY_PORT) + CAM_PROXY_PATH;
+    /* mDNS 失败 -> 固定 IP 兜底（AP 保留地址，稳定） */
+    g_url = String("http://") + g_cam_fallback + ":" + String(CAM_PORT) + CAM_PATH;
     g_mdns_ok = true;
     g_mdns_ms = now;
-    cam_client_log("[cam] proxy fallback to %s\n", g_cam_proxy_fallback);
+    cam_client_log("[cam] camera fallback to %s\n", g_cam_fallback);
     return g_url;
 }
 
@@ -246,6 +263,11 @@ static void url_split(const String &url, String &host, uint16_t &port, String &p
     }
 }
 
+/* fetch_jpeg 连接失败标志：true=出站 TCP 连接失败（本地 lwIP 栈被 RST 夯死），
+ * false=连接成功但取不到帧（远端无帧/503）。供 cam_task 区分自愈触发条件，
+ * 避免把"远端无帧"误判为"本地栈故障"导致 WiFi 震荡。 */
+static bool g_cam_conn_fail = false;
+
 /* ★ 短连接拉取一帧 JPEG 到 g_jpeg，返回字节数；失败返回 0。
  * 用短连接（每次新建、用完即关）而不是 keep-alive 长连接——
  * 原因：BTWIFI6-169148 会对 ESP32 的长连接 TCP 会话做定期清理
@@ -254,6 +276,7 @@ static void url_split(const String &url, String &host, uint16_t &port, String &p
  * 并发强，每 500ms 一个短连接毫无压力，不像摄像头 WebServer 单槽位）。 */
 size_t fetch_jpeg(const String &url)
 {
+    g_cam_conn_fail = false;
     if (url.length() == 0) return 0;
 
     String host, path;
@@ -265,10 +288,18 @@ size_t fetch_jpeg(const String &url)
     WiFiClient conn;
     if (!conn.connect(host.c_str(), port)) {
         cam_client_log("[cam] TCP connect %s:%u failed\n", host.c_str(), port);
+        g_cam_conn_fail = true;        /* 本地出站连接失败：PCB 池可能已被 TIME_WAIT 榨干 */
         if (g_mdns_ok) g_mdns_ms = 0;   /* 可能后端 IP 变了，强制重解析 */
         return 0;
     }
     conn.setTimeout(3000);
+
+    /* ★ 8-18 修正：这里曾试图用 SO_LINGER(l_linger=0) 让 close() 发 RST 跳过
+     * TIME_WAIT，但 ESP-IDF 的 lwIP 默认 LWIP_SO_LINGER=0，setsockopt 直接返回
+     * errno 109 (ENOPROTOOPT)，只在日志刷 "setSocketOption(): fail on 50"，
+     * 毫无效果 —— 已移除。且 TIME_WAIT 本身并非楔死主因：lwIP 的 tcp_alloc()
+     * 在 PCB 池耗尽时会调 tcp_kill_timewait() 自动回收最老的 TIME_WAIT PCB。
+     * 真凶改由 net_diag() 打印 PCB/socket 实测占用来定位，不再靠猜。 */
 
     /* 发送请求（HTTP/1.1，Connection: close 让服务端响应后即断） */
     conn.print("GET ");
@@ -355,6 +386,7 @@ size_t fetch_jpeg(const String &url)
     return total;
 }
 
+#ifdef CAM_USB_INPUT
 /* ★ USB-CDC pump：收帧 + 帧间隙命令解析一体化（RLCD-004.2 重构）。
  * 帧协议与摄像头串口直传一致：AA 55 5A A5 | len(2B BE) | JPEG | crc16(2B BE, len+data 累加)
  * 与旧 fetch_usb_frame 的差异：不再"只在读帧阶段跑"，而是可随时以时间分片被
@@ -414,6 +446,8 @@ static size_t usb_pump_frame(uint32_t ms)
     return 0;   /* 分片内无完整帧 */
 }
 
+#endif  /* CAM_USB_INPUT */
+
 #ifdef CAM_USB_INPUT
 /* ★ RLCD-004.2：USB RX 消费任务（core0 高优先）。
  * 持续 pump USB-CDC：帧间隙命令即时喂 cmd_feed（回 ACK）；完整帧存入 PSRAM
@@ -458,12 +492,179 @@ void rx_task(void *arg)
 }
 #endif  /* CAM_USB_INPUT */
 
+/* 方案B：WiFi 命令服务（端口 8771）。M1 finger_page_control 经 TCP 下发
+ * "PAGE:HOME|GUITAR|CAMERA\n"，本任务解析并登记 g_page_req（与 USB 版 cmd_feed
+ * 同语义）；cam_client_send_ack() 置 g_ack_pending 后，本任务在同一 TCP 连接上
+ * 写回 "ACK:PAGE:X\n"。所有 socket I/O 集中在本任务，避免跨任务写同一 socket。 */
+static void cmd_server_task(void *arg)
+{
+    (void)arg;
+    char line[24];
+    int  li = 0;
+    for (;;) {
+        if (!g_cmd_client || !g_cmd_client.connected()) {
+            WiFiClient c = g_cmd_server.available();
+            if (c) { g_cmd_client = c; li = 0; cam_client_log("[cmd] client connected\n"); }
+        }
+        if (g_cmd_client && g_cmd_client.connected()) {
+            while (g_cmd_client.available()) {
+                char ch = (char)g_cmd_client.read();
+                if (ch == '\n' || ch == '\r') {
+                    if (li > 0) {
+                        line[li] = '\0';
+                        int8_t page = -1;
+                        if      (strcmp(line, "PAGE:HOME")   == 0) page = 0;
+                        else if (strcmp(line, "PAGE:GUITAR") == 0) page = 1;
+                        else if (strcmp(line, "PAGE:CAMERA") == 0) page = 2;
+                        if (page >= 0) g_page_req = page;
+                    }
+                    li = 0;
+                } else if (li < (int)sizeof(line) - 1) {
+                    line[li++] = ch;
+                }
+            }
+        }
+        /* 回 ACK（main loop 在切页确认后置 g_ack_pending） */
+        if (g_ack_pending >= 0 && g_cmd_client && g_cmd_client.connected()) {
+            const char *name = (g_ack_pending == 0) ? "PAGE:HOME" :
+                               (g_ack_pending == 1) ? "PAGE:GUITAR" :
+                               (g_ack_pending == 2) ? "PAGE:CAMERA" : nullptr;
+            if (name) {
+                g_cmd_client.print("ACK:");
+                g_cmd_client.print(name);
+                g_cmd_client.print("\n");
+                cam_client_log("[cmd] ACK sent: %s\n", name);
+            }
+            g_ack_pending = -1;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+#ifndef CAM_USB_INPUT
+/* ★ 8-18 网络资源诊断 —— 定位"ping 0% 丢包却什么都连不上"的真凶。
+ * 之前靠推测（先怀疑供电/RF/路由器，再怀疑 TIME_WAIT 耗尽 PCB 池）全部落空，
+ * 改为直接读 lwIP 内部计数，用数字说话：
+ *   free_fd 掉到 0            → socket fd 耗尽（CONFIG_LWIP_MAX_SOCKETS 上限，泄漏不会自动回收）
+ *   active 持续涨不回落       → 连接对象没被正常关闭（真泄漏）
+ *   tw 很大但 active/fd 正常  → 只是 TIME_WAIT 堆积；lwIP tcp_alloc() 会 tcp_kill_timewait()
+ *                               自动回收最老的，通常无害，可排除
+ *   四项全正常却连不上        → 本地栈资源无关，问题在 RF/AP/对端
+ * 遍历链表带 64 上限：lwIP 线程可能并发改链表，防万一读到环形结构死循环。
+ * fd 探测：连续 socket() 到失败为止即剩余配额，用完立刻全部 close 归还。 */
+static void net_diag(const char *tag)
+{
+    int n_active = 0, n_tw = 0, n_bound = 0, n_listen = 0;
+    for (struct tcp_pcb *p = tcp_active_pcbs; p && n_active < 64; p = p->next) n_active++;
+    for (struct tcp_pcb *p = tcp_tw_pcbs;     p && n_tw     < 64; p = p->next) n_tw++;
+    for (struct tcp_pcb *p = tcp_bound_pcbs;  p && n_bound  < 64; p = p->next) n_bound++;
+    for (struct tcp_pcb_listen *p = tcp_listen_pcbs.listen_pcbs;
+         p && n_listen < 64; p = p->next) n_listen++;
+
+    int fds[24];
+    int free_fd = 0;
+    while (free_fd < 24) {
+        int fd = lwip_socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) break;
+        fds[free_fd++] = fd;
+    }
+    for (int i = 0; i < free_fd; i++) lwip_close(fds[i]);
+
+    /* 带上 RSSI/状态：资源走势与信号走势必须对齐看，才能分清
+     * "资源耗尽导致连不上" 与 "信号掉了导致连不上" —— 前者 free_fd 会跌，
+     * 后者 free_fd 不动而 rssi 掉/status 变。 */
+    cam_client_log("[net] %s active=%d tw=%d bound=%d listen=%d free_fd=%d heap=%u wl=%d rssi=%d ch=%d\n",
+                   tag, n_active, n_tw, n_bound, n_listen, free_fd,
+                   (unsigned)ESP.getFreeHeap(),
+                   (int)WiFi.status(), (int)WiFi.RSSI(), (int)WiFi.channel());
+}
+
+/* ★ 8-18：裸 socket 探针 —— 必须拿到 connect 的 errno 才能定位故障层次。
+ * Arduino 的 WiFiClient::connect() 超时只走 log_i（默认不输出），失败原因被吞掉，
+ * 所以改用 lwip socket 自己做非阻塞 connect + select，把 errno 打出来。判据：
+ *   ETIMEDOUT(116)                → SYN 发出去无人应答（AP 不转发/对端不在/信道问题）
+ *   ECONNREFUSED(111)             → 收到 RST（对端在，但端口没开 → 网络通！）
+ *   EHOSTUNREACH(118)/ENETUNREACH(114) → 路由表/ARP 解析不出下一跳
+ *   ENOBUFS(105)/ENOMEM(12)       → lwIP 内存或 PCB 真的不够
+ * 返回 0=成功，>0=errno，-1=socket 创建失败。 */
+static int probe_connect(IPAddress ip, uint16_t port, uint32_t timeout_ms)
+{
+    int fd = lwip_socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family      = AF_INET;
+    sa.sin_port        = htons(port);
+    sa.sin_addr.s_addr = (uint32_t)ip;
+
+    int rc = lwip_connect(fd, (struct sockaddr *)&sa, sizeof(sa));
+    if (rc == 0) { lwip_close(fd); return 0; }         /* 立刻连上（同网段罕见但可能） */
+    if (errno != EINPROGRESS) { int e = errno; lwip_close(fd); return e; }
+
+    fd_set wr;
+    FD_ZERO(&wr);
+    FD_SET(fd, &wr);
+    struct timeval tv;
+    tv.tv_sec  = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    rc = lwip_select(fd + 1, nullptr, &wr, nullptr, &tv);
+    if (rc == 0) { lwip_close(fd); return ETIMEDOUT; } /* select 超时：SYN 无响应 */
+    if (rc < 0)  { int e = errno; lwip_close(fd); return e ? e : -1; }
+
+    int soerr = 0;
+    socklen_t slen = sizeof(soerr);
+    lwip_getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &slen);
+    lwip_close(fd);
+    return soerr;                                      /* 0=连接建立成功 */
+}
+
+/* ★ 8-18：用网关当"试纸"，区分【本地 TCP 栈楔死】与【远端不可达】。
+ * 注意 ECONNREFUSED 也算"网络健康"——收到 RST 说明包一来一回都通了，
+ * 只是网关没开那个端口。之前用 WiFiClient 时把 RST 也当失败，会误判。
+ * 附带 loopback(127.0.0.1) 探测：loopback 走不出协议栈，
+ * 若 loopback 也失败 → 是 socket/lwIP 层坏了；loopback 成功而网关失败
+ * → 协议栈健康，问题出在 WiFi 数据面（发得出但收不回）。 */
+static bool local_tcp_stack_alive(void)
+{
+    IPAddress gw = WiFi.gatewayIP();
+    if ((uint32_t)gw == 0) return false;
+
+    /* 超时 800ms：同网段网关正常 RTT <50ms（实测 4~20ms），800ms 已是 16 倍余量。
+     * 原先 1500ms 让每次判定多等 0.7s，4 次就白等近 3 秒，直接拖慢自愈。 */
+    int e_gw = probe_connect(gw, 80, 800);
+    if (e_gw == 0 || e_gw == ECONNREFUSED) return true;
+
+    /* 网关不通：再测 loopback 与 M1，把故障层次一次问清楚 */
+    IPAddress lo(127, 0, 0, 1);
+    int e_lo = probe_connect(lo, 8771, 500);      /* 本机 cmd_server 监听端口 */
+    cam_client_log("[net] probe gw(%s):80 errno=%d  loopback:8771 errno=%d\n",
+                   gw.toString().c_str(), e_gw, e_lo);
+    return false;
+}
+#endif
+
 void cam_task(void *arg)
 {
     uint32_t fail_ms = 0;
-    uint32_t fail_total = 0;   /* 连续失败总次数：用于网络自愈（不重置，两阶段各触发一次） */
+    uint32_t fail_total = 0;   /* 远端摄像头取流失败次数（仅退避重试，不触发自愈重启） */
+    uint32_t local_fail = 0;   /* 本地 WiFi 掉线次数（驱动自愈：重连/整机重启） */
+#ifndef CAM_USB_INPUT
+    uint32_t diag_ms  = 0;     /* net_diag 基线节流：20s 一次，用于看资源占用走势 */
+    uint32_t heal_cnt = 0;     /* 连续 hard restart 次数；取帧成功即清零，达 6 次才整机重启 */
+#endif
     for (;;) {
         uint32_t start = millis();
+
+#ifndef CAM_USB_INPUT
+        /* 每 20s 打一次基线：只看楔死瞬间的快照无法区分"缓慢泄漏"与"瞬间耗尽"，
+         * 有了时间序列才能算出斜率（例如 fd 每分钟少 2 个 = 每帧漏 1 个）。 */
+        if (diag_ms == 0 || millis() - diag_ms > 20000) {
+            diag_ms = millis();
+            net_diag("base");
+        }
+#endif
 
 #ifdef CAM_USB_INPUT
         /* USB 全链路视频模式：帧由 rx_task 收进 PSRAM 帧槽（free/ready 队列），
@@ -529,6 +730,8 @@ void cam_task(void *arg)
                     g_ready = true;
                     fail_ms = 0;
                     fail_total = 0;
+                    local_fail = 0;
+                    heal_cnt = 0;   /* 取到帧＝数据面已恢复，重置自愈升级计数 */
 
                     /* 诊断（限速）：字节和 checksum 判断帧是否真的在变 */
                     uint32_t sum = 0;
@@ -548,30 +751,83 @@ void cam_task(void *arg)
                     fail_total++;
                 }
             } else {
-                fail_ms = (fail_ms == 0) ? FRAME_INTERVAL_MS : RETRY_BACKOFF_MS;
-                fail_total++;
+                g_mdns_ms = 0;   /* 取流失败：清 5 分钟缓存，下次循环重新探测 M1 代理(可能已恢复) */
+                if (g_cam_conn_fail) {
+                    /* 出站 TCP 连接失败：可能是【本地栈楔死】也可能只是【远端挂了】，
+                     * 用网关探测区分，避免把远端故障当本地故障而无谓重启面板。 */
+                    if (WiFi.status() == WL_CONNECTED) {
+                        if (local_tcp_stack_alive()) {
+                            fail_ms = (fail_ms == 0) ? FRAME_INTERVAL_MS : RETRY_BACKOFF_MS;
+                            fail_total++;
+                            if ((fail_total % 10) == 1)
+                                cam_client_log("[cam] remote unreachable, local stack OK (fail_total=%u)\n",
+                                               (unsigned)fail_total);
+                        } else {
+                            local_fail++;
+                            cam_client_log("[cam] local TCP stack wedged (gw unreachable, local_fail=%u)\n",
+                                           (unsigned)local_fail);
+                            net_diag("WEDGED");   /* 楔死现场取证：PCB/fd 到底是哪一项见底 */
+                        }
+                    }
+                } else {
+                    fail_ms = (fail_ms == 0) ? FRAME_INTERVAL_MS : RETRY_BACKOFF_MS;
+                    fail_total++;   /* 远端取流失败：仅退避重试 */
+                }
             }
+        } else {
+            /* 本地 WiFi 掉线：计入 local_fail 驱动自愈；远端不可达不算 */
+            g_mdns_ms = 0;   /* 清缓存，重连后重新探测 M1 代理 */
+            local_fail++;
+            cam_client_log("[cam] local WiFi down (local_fail=%u)\n", (unsigned)local_fail);
         }
 #endif  /* CAM_USB_INPUT */
 
 #ifdef CAM_USB_INPUT
         /* USB 全链路视频模式不依赖 WiFi：跳过 WiFi 自愈/重启逻辑 */
         (void)fail_total;
+        (void)local_fail;
 #else
-        /* ★ 网络自愈（RLCD-003 Defect B 修复）：BTWIFI6 对 ESP32 出站 TCP 做间歇性
-         * RST 会把 lwIP TCP 栈打坏（errno 113 死循环）。两阶段计数不重置：
-         *  - 第 24 次失败：重启 WiFi 关联（disconnect(false) 不关 radio，再 reconnect）
-         *  - 第 48 次失败（WiFi 重启仍无效）：整机重启兜底 */
-        if (fail_total == 24) {
-            Serial.println("[cam] self-heal-1: WiFi reconnect (RST-stuck stack)");
-            WiFi.disconnect(false);   /* false：不关闭 radio，reconnect 才能生效 */
-            delay(200);
-            WiFi.reconnect();
-            g_mdns_ms = 0;            /* 强制重新解析后端 */
-        } else if (fail_total == 48) {
-            Serial.println("[cam] self-heal-2: WiFi restart failed, rebooting...");
-            delay(200);
-            esp_restart();
+        /* ★ 8-18 网络自愈（已由实测数据重写，之前几版的根因判断全部作废）：
+         * 真凶＝**WiFi 单播数据面周期性双向死亡，而关联层仍活着**。取证：
+         *   [net] WEDGED active=0 tw=0 listen=1 free_fd=14 wl=3 rssi=-38
+         *   [net] probe gw:80 errno=116(ETIMEDOUT)  loopback:8771 errno=0
+         *   同时刻 M1→RLCD ping 100% 丢包，M1→网关 0% 丢包
+         * 即 lwIP 资源全空闲、协议栈（loopback）完全正常、信号极好、关联未断，
+         * 但对外 SYN 收不到任何回应。故与 socket 泄漏/TIME_WAIT/供电/RF 全都无关
+         * （那几版假说均已被上面的数字推翻）。AP 侧元凶候选：MiFi 的
+         * <ssv_wifi6>1 独立 WiFi6 开关仍开着 + 允许 40MHz，ax 调度与 ESP32
+         * 老 WiFi 栈不兼容 —— beacon 照收所以不掉线，单播帧却收发失效。
+         *
+         * 自愈策略（实测有效性排序）：
+         *   WiFi.reconnect()   ❌ 无效：同秒 CONNECTED+GOT_IP，紧接着仍 ETIMEDOUT
+         *   wifi_hard_restart() ✅ 有效：radio OFF→STA→重新 begin，走完整
+         *                          scan/auth/assoc/4-way，实测恢复后 60s 零丢包
+         *   esp_restart()       ✅ 有效但代价大（丢 UI 状态），仅作最终兜底
+         * 阈值演进（都有实测数据，血泪）：
+         *   local_fail==12 → 中断约 90 秒（太慢）
+         *   local_fail>=4  → 中断约 36 秒（ping 丢包 39%→19.2%）
+         *   local_fail>=2  → ❌ 反而恶化到 76% 丢包！原因不在阈值，而在"自愈本身太贵"：
+         *                    当时 wifi_hard_restart 走 start_wifi 的冷启动列表轮询，
+         *                    每次在无关 SSID 上白等 8 秒 → 单次恢复 16~24 秒，
+         *                    触发越频繁 → 设备越多时间耗在重新关联上。
+         *   local_fail>=3  → 当前值。前提是 wifi_hard_restart 已改为
+         *                    "定 BSSID+定信道快速重连"（2~4 秒回来）。
+         *                    预期最坏中断 ≈ 3 次判定(~10s) + 重连(~3s) ≈ 13 秒。
+         * 判定本身很可靠（只有"网关 TCP 也连不上"才计数，远端挂掉不会误触发）。
+         * 每次 hard restart 后归零重新计数，连续 8 次都救不回来才整机重启；
+         * 取帧一旦成功 heal_cnt 清零。 */
+        if (local_fail >= 3) {
+            heal_cnt++;
+            if (heal_cnt >= 8) {
+                Serial.println("[cam] self-heal-2: hard restart x8 ineffective, rebooting...");
+                delay(200);
+                esp_restart();
+            }
+            Serial.printf("[cam] self-heal-1: hard restart WiFi (attempt %u)\n",
+                          (unsigned)heal_cnt);
+            wifi_hard_restart();
+            g_mdns_ms   = 0;   /* 强制重新解析后端 */
+            local_fail  = 0;   /* 归零：给重连后的恢复留出观察窗口，避免立刻再触发 */
         }
 #endif  /* CAM_USB_INPUT */
 
@@ -658,6 +914,9 @@ void cam_client_init(void)
     xTaskCreatePinnedToCore(rx_task, "camrx", 4096, nullptr, 6, nullptr, 0);
     xTaskCreatePinnedToCore(cam_task, "camfetch", 8192, nullptr, 4, nullptr, 1);
 #else
+    /* 方案B：WiFi 命令服务（PAGE 命令 + ACK 回执），与帧取回并存 */
+    g_cmd_server.begin();
+    xTaskCreate(cmd_server_task, "camcmd", 4096, nullptr, 4, nullptr);
     /* 栈 8192：VGA 640x480 全尺寸解码（TJpgDec 内部 MCU 缓冲 + 裁切）需要大栈 */
     xTaskCreate(cam_task, "camfetch", 8192, nullptr, 4, nullptr);
 #endif
@@ -696,7 +955,10 @@ int8_t cam_client_take_page_cmd(void)
     if (p >= 0) g_page_req = -1;   /* 取走即清空，同一命令只执行一次 */
     return p;
 #else
-    return -1;                     /* WiFi 模式无 USB 命令通道 */
+    /* 方案B：WiFi 命令服务登记的请求同样从这里取走（取走即清 -1） */
+    int8_t p = g_page_req;
+    if (p >= 0) g_page_req = -1;
+    return p;
 #endif
 }
 
@@ -722,6 +984,8 @@ void cam_client_send_ack(int8_t page)
         if (g_serial_lock) xSemaphoreGive(g_serial_lock);
     }
 #else
-    (void)page;
+    /* 方案B：仅置 g_ack_pending，由 cmd_server_task 在同一 TCP 连接上回 ACK
+     * （socket I/O 集中在该任务，避免跨任务写同一 socket）。 */
+    if (page >= 0 && page <= 2) g_ack_pending = page;
 #endif
 }

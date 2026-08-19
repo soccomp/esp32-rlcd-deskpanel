@@ -21,11 +21,14 @@ void ui_clock_init(lv_obj_t *parent, lv_obj_t *status_bar);
 
 /* ---- 股票指数行情（右上卡） ----
  * ui_clock_set_stocks(): 仅缓存数据（线程安全、不触碰 LVGL 对象），
- *   由 fetch_stocks_data() 在解析后端 /api/stocks 后调用。
+ *   由 fetch_stocks_data() 在直连腾讯行情源成功后调用。
+ * ui_clock_set_stocks_time(): 记录最近一次成功刷新时刻（Unix 秒，
+ *   线程安全，仅写 volatile），卡内右下角显示为 MM-DD HH:MM（与天气卡同格式）。
  * ui_clock_update_stocks(): 把缓存应用到行情卡（必须持有 Lvgl_lock 或在
- *   LVGL 任务内调用）。三指数：上证/沪深300/创业板指。 */
+ *   LVGL 任务内调用）。四行：上证/沪深300/创业板指/AI(159819)。 */
 void ui_clock_set_stocks(const char *names[3], const float values[3],
                          const float pcts[3], const bool ups[3]);
+void ui_clock_set_stocks_time(uint32_t ts);
 void ui_clock_update_stocks(void);
 
 /* ---- 天气 ----

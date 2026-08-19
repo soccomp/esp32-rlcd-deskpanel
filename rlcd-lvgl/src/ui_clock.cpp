@@ -9,7 +9,8 @@
 LV_FONT_DECLARE(lv_font_montserrat_12);
 #include "weather_icons.h"     // 单色天气图标（24x24 indexed-1bit）
 #include "brand_logo.h"        // 单色品牌标识（160x48 RGB565）
-#include "french_lib.h"        // 法语词库抽象：SD 优先 + 内置兜底（法语学习卡用）
+#include "french_lib.h"        // 法语对话词库（内置 200 组，法语学习卡用）
+#include "cam_client.h"        // 摄像头三态（状态栏 CAM 状态点用）
 #include <time.h>
 #include <string.h>
 #include <Arduino.h>
@@ -24,29 +25,38 @@ static lv_obj_t *g_lunar_label= nullptr;  // 农历日期（状态栏，替代�
 static int g_lunar_ymd[3] = {0, 0, 0};    // 上次更新的农历年月日（仅变化时刷新 label）
 static const char *g_weekday_cn[] = {"周日", "周一", "周二", "周三", "周四", "周五", "周六"};
 
-/* ---- 法语学习卡（右下，替代摄像头缩略） ---- */
+/* ---- 法语学习卡（右下，替代摄像头缩略） ----
+ * 8-14 起：一组完整对话同屏双语（A 法语 / A 中文 / 分隔线 / B 法语 / B 中文），
+ * 14px 字体（chinese_14），5 分钟换一组。 */
 static lv_obj_t *g_fr_card  = nullptr;    // 卡片容器
-static lv_obj_t *g_fr_t1    = nullptr;    // 句1 法语
-static lv_obj_t *g_fr_c1    = nullptr;    // 句1 中文
-static lv_obj_t *g_fr_t2    = nullptr;    // 句2 法语
-static lv_obj_t *g_fr_c2    = nullptr;    // 句2 中文
-static uint16_t  g_fr_idx1  = 0;          // 当前句1 索引
-static uint16_t  g_fr_idx2  = 0;          // 当前句2 索引（与句1 不重复）
+static lv_obj_t *g_fr_a     = nullptr;    // A 句 法语（可换行两行）
+static lv_obj_t *g_fr_ac    = nullptr;    // A 句 中文（单行）
+static lv_obj_t *g_fr_sep   = nullptr;    // A/B 分隔线
+static lv_obj_t *g_fr_b     = nullptr;    // B 句 法语（可换行两行）
+static lv_obj_t *g_fr_bc    = nullptr;    // B 句 中文（单行）
 
-/* ---- 右上：股票指数行情卡（上证/沪深300/创业板指） ---- */
-/* ---- 右上：股票指数行情卡（弧形边框与底部卡一致，170x88 原 CAM 区域） ----
- * 三行：名称 点位 ▲/▼百分比；上涨=黑底白字反显，下跌=正常黑字。
- * 每行 = 行底条容器(固定 158×22, bg 黑/透明) + 内嵌文本 label。
- * 数据由 M1 后端 /api/stocks 提供，交易时段（工作日 09:30-11:30/13:00-15:30）
- * 每 10 分钟刷新（main.cpp），非交易时段不刷新、保留最后一次数据。 */
+/* ---- 状态栏：摄像头状态（CAM + 状态点，全局常驻） ---- */
+static lv_obj_t *g_cam_status = nullptr;  // "CAM" 文字（离线时黑底反显）
+static lv_obj_t *g_cam_dot    = nullptr;  // 状态点圆（实心=在线 / 空心=陈旧、离线）
+
+/* ---- 右上：股票指数行情卡（上证/沪深300/创业板指/AI） ----
+ * 四行：名称 点位 ▲/▼百分比；上涨=黑底白字反显，下跌=正常黑字。
+ * 每行 = 行底条容器(固定 149×20, bg 黑/透明) + 内嵌文本 label。
+ * 数据由 stocks_client 直连腾讯行情源（qt.gtimg.cn）提供，交易时段
+ * （工作日 09:30-11:30/13:00-15:30）每 10 分钟刷新（main.cpp），
+ * 非交易时段不刷新、保留最后一次数据。卡内右下角显示最近刷新时间。 */
 #define STOCK_ROWS 4
 static lv_obj_t *g_stk_card = nullptr;            // 行情卡容器（弧形边框）
 static lv_obj_t *g_stk_bg[STOCK_ROWS] = {0};     // 每行底条容器（决定反显宽度 = 158 全宽）
-static lv_obj_t *g_stk_text[STOCK_ROWS] = {0};    // 每行内嵌文本 label
+static lv_obj_t *g_stk_name_lb[STOCK_ROWS] = {0}; // 每行：名称（左对齐，固定 x）
+static lv_obj_t *g_stk_val_lb[STOCK_ROWS] = {0};  // 每行：点位（右对齐，竖列对齐）
+static lv_obj_t *g_stk_pct_lb[STOCK_ROWS] = {0};  // 每行：百分比（右对齐，竖列对齐）
 static lv_obj_t *g_stk_loading = nullptr;         // “行情获取中...” 占位
+static lv_obj_t *g_stk_time = nullptr;            // 右下角刷新时间（MM-DD HH:MM，montserrat_12）
 
 /* 行情数据缓存：set 侧（网络任务）只写缓存，update 侧（LVGL 任务）渲染 */
 static volatile bool g_stk_valid = false;
+static volatile uint32_t g_stk_last_ts = 0;       // 最近一次成功刷新时刻（Unix 秒）
 static char g_stk_name[STOCK_ROWS][16] = {{0}};
 static float g_stk_value[STOCK_ROWS] = {0};
 static float g_stk_pct[STOCK_ROWS] = {0};
@@ -94,9 +104,9 @@ static const lv_coord_t FLIP_CARD_H = 64;   /* 缩小反色黑卡，让时钟居
 /* 定时器回调前向声明（定义见文件末尾） */
 static void clock_tick_cb(lv_timer_t *t);
 static void env_tick_cb(lv_timer_t *t);
-static void fr_learn_cb(lv_timer_t *t);       /* 法语学习卡 5 分钟换句 */
+static void fr_learn_cb(lv_timer_t *t);       /* 法语学习卡 5 分钟换一组 */
 
-/* 法语学习卡：随机两条法语+中文翻译（8-13 替代首页摄像头缩略） */
+/* 法语学习卡：一组对话同屏双语（8-14 替代两条随机短句） */
 static void build_fr_learn_card(lv_obj_t *parent, lv_coord_t x, lv_coord_t y,
                                 lv_coord_t w, lv_coord_t h);
 
@@ -233,7 +243,7 @@ static lv_obj_t *make_weather_row(lv_obj_t *parent,
  * ============================================================ */
 void ui_clock_init(lv_obj_t *parent, lv_obj_t *status_bar)
 {
-    french_lib_init();   /* SD 词库优先，无卡/无文件用内置 100 句 */
+    /* 法语词库为内置 200 组，无需初始化 */
 
     /* ---- 日期并入全局状态栏：MM-DD + 中文星期，紧贴 WiFi 图标 ----
      * 用 chinese_14：含中文星期（周四）与 ASCII，montserrat_14 无中文会出方框 ---- */
@@ -249,6 +259,26 @@ void ui_clock_init(lv_obj_t *parent, lv_obj_t *status_bar)
     lv_obj_set_style_text_color(g_lunar_label, lv_color_black(), 0);
     lv_label_set_text(g_lunar_label, "");
     lv_obj_align_to(g_lunar_label, g_date_label, LV_ALIGN_OUT_RIGHT_MID, 4, 0);
+
+    /* ---- 摄像头状态（CAM + 状态点，全局常驻，右对齐到电池图标左侧） ----
+     * 三态由 update_cam_status() 在 1s 定时器里刷新：在线=实心点 / 陈旧=空心圈 / 离线=黑底反显 */
+    g_cam_dot = lv_obj_create(status_bar);
+    lv_obj_remove_style_all(g_cam_dot);
+    lv_obj_set_size(g_cam_dot, 7, 7);
+    lv_obj_set_style_radius(g_cam_dot, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(g_cam_dot, lv_color_black(), 0);
+    lv_obj_set_style_border_color(g_cam_dot, lv_color_black(), 0);
+    lv_obj_set_style_border_width(g_cam_dot, 1, 0);   /* 初始空心（未连接） */
+    lv_obj_align(g_cam_dot, LV_ALIGN_RIGHT_MID, -30, 0);
+
+    g_cam_status = lv_label_create(status_bar);
+    lv_obj_set_style_text_font(g_cam_status, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(g_cam_status, lv_color_black(), 0);
+    lv_obj_set_style_bg_color(g_cam_status, lv_color_black(), 0);
+    lv_obj_set_style_radius(g_cam_status, 3, 0);
+    lv_obj_set_style_pad_all(g_cam_status, 3, 0);
+    lv_label_set_text(g_cam_status, "CAM");
+    lv_obj_align_to(g_cam_status, g_cam_dot, LV_ALIGN_OUT_LEFT_MID, -2, 0);
 
     /* 页面从状态栏下方立即开始，释放原顶部题签占用的 26px。 */
     lv_obj_t *rule = lv_obj_create(parent);
@@ -306,12 +336,13 @@ void ui_clock_init(lv_obj_t *parent, lv_obj_t *status_bar)
     lv_img_set_src(logo, &shenzhou_media_logo);
     lv_obj_set_pos(logo, 8, 113);
 
-    /* ---- 右上：股票指数行情卡（弧形边框与底部卡一致，170x104）
+    /* ---- 右上：股票指数行情卡（弧形边框与底部卡一致，170x122）
      * 四行：名称 点位 百分比；上涨=黑底白字反显，下跌=正常黑字。
-     * 顶边 y=5 与左侧时钟卡(4,5)对齐；数据由 M1 后端 /api/stocks 提供。 */
+     * 底行（y≈94）为刷新时间戳，montserrat_12 右对齐：MMDD:HHMM。
+     * 顶边 y=5 与左侧时钟卡(4,5)对齐；数据由 stocks_client 直连腾讯提供。 */
     g_stk_card = lv_obj_create(parent);
     lv_obj_remove_style_all(g_stk_card);
-    lv_obj_set_size(g_stk_card, 170, 104);
+    lv_obj_set_size(g_stk_card, 170, 122);
     lv_obj_set_pos(g_stk_card, 226, 5);
     lv_obj_set_style_bg_opa(g_stk_card, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_color(g_stk_card, lv_color_black(), 0);
@@ -320,7 +351,9 @@ void ui_clock_init(lv_obj_t *parent, lv_obj_t *status_bar)
     lv_obj_set_style_pad_all(g_stk_card, 4, 0);
     lv_obj_clear_flag(g_stk_card, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* 四行行情：每行 = 底条容器(固定 149×20, bg 黑/透明) + 内嵌文本 label
+    /* 四行行情：每行 = 底条容器(固定 149×20, bg 黑/透明) + 三个独立 label
+     * 列布局（相对容器，右缘 145 = 149-4 左 pad）：名称左对齐固定 x=4，
+     * 点位/百分比右对齐固定列 x=40/93 —— 竖列跨行严格对齐（不等宽字体也能对齐）。
      * 容器 x=6(相对卡) → 实际左缘 238；宽 149 → 右缘 387（向右扩 3px 底色区域）；
      * 卡片右缘 396 → 右侧留白 9px（左留 12px）。y 起点 2、行距 22：整体垂直居中。 */
     for (int i = 0; i < STOCK_ROWS; ++i) {
@@ -328,17 +361,49 @@ void ui_clock_init(lv_obj_t *parent, lv_obj_t *status_bar)
         lv_obj_remove_style_all(g_stk_bg[i]);
         lv_obj_set_size(g_stk_bg[i], 149, 20);
         lv_obj_set_style_radius(g_stk_bg[i], 3, 0);
-        lv_obj_set_style_pad_left(g_stk_bg[i], 4, 0);
-        lv_obj_set_style_pad_top(g_stk_bg[i], 1, 0);
         lv_obj_clear_flag(g_stk_bg[i], LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_align(g_stk_bg[i], LV_ALIGN_TOP_LEFT, 6, 2 + i * 22);
 
-        g_stk_text[i] = lv_label_create(g_stk_bg[i]);
-        lv_obj_set_style_text_font(g_stk_text[i], &lv_font_chinese_14, 0);
-        lv_obj_set_style_text_color(g_stk_text[i], lv_color_black(), 0);
-        lv_label_set_long_mode(g_stk_text[i], LV_LABEL_LONG_CLIP);
-        lv_label_set_text(g_stk_text[i], "--  ---.--  ---.--%");
+        /* 名称列：左对齐（上证/创板 2 全角字 = 28px < 36） */
+        g_stk_name_lb[i] = lv_label_create(g_stk_bg[i]);
+        lv_obj_set_style_text_font(g_stk_name_lb[i], &lv_font_chinese_14, 0);
+        lv_obj_set_style_text_color(g_stk_name_lb[i], lv_color_black(), 0);
+        lv_obj_set_size(g_stk_name_lb[i], 36, 20);
+        lv_label_set_long_mode(g_stk_name_lb[i], LV_LABEL_LONG_CLIP);
+        lv_label_set_text(g_stk_name_lb[i], "--");
+        lv_obj_set_pos(g_stk_name_lb[i], 4, 1);
+
+        /* 点位列：右对齐（最大 "9999.99" 7 字符 ≈ 49px < 53） */
+        g_stk_val_lb[i] = lv_label_create(g_stk_bg[i]);
+        lv_obj_set_style_text_font(g_stk_val_lb[i], &lv_font_chinese_14, 0);
+        lv_obj_set_style_text_color(g_stk_val_lb[i], lv_color_black(), 0);
+        lv_obj_set_size(g_stk_val_lb[i], 53, 20);
+        lv_obj_set_style_text_align(g_stk_val_lb[i], LV_TEXT_ALIGN_RIGHT, 0);
+        lv_label_set_long_mode(g_stk_val_lb[i], LV_LABEL_LONG_CLIP);
+        lv_label_set_text(g_stk_val_lb[i], "--.--");
+        lv_obj_set_pos(g_stk_val_lb[i], 40, 1);
+
+        /* 百分比列：右对齐（最大 "-100.00%" 8 字符 ≈ 51px < 52） */
+        g_stk_pct_lb[i] = lv_label_create(g_stk_bg[i]);
+        lv_obj_set_style_text_font(g_stk_pct_lb[i], &lv_font_chinese_14, 0);
+        lv_obj_set_style_text_color(g_stk_pct_lb[i], lv_color_black(), 0);
+        lv_obj_set_size(g_stk_pct_lb[i], 52, 20);
+        lv_obj_set_style_text_align(g_stk_pct_lb[i], LV_TEXT_ALIGN_RIGHT, 0);
+        lv_label_set_long_mode(g_stk_pct_lb[i], LV_LABEL_LONG_CLIP);
+        lv_label_set_text(g_stk_pct_lb[i], "--.--%");
+        lv_obj_set_pos(g_stk_pct_lb[i], 93, 1);
     }
+
+    /* 右下角刷新时间戳：montserrat_12 小字右对齐，MM-DD HH:MM（与天气卡同格式） */
+    g_stk_time = lv_label_create(g_stk_card);
+    lv_obj_set_style_text_font(g_stk_time, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(g_stk_time, lv_color_black(), 0);
+    lv_obj_set_width(g_stk_time, 150);
+    lv_obj_set_style_text_align(g_stk_time, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_label_set_long_mode(g_stk_time, LV_LABEL_LONG_CLIP);
+    lv_label_set_text(g_stk_time, "");
+    lv_obj_set_pos(g_stk_time, 6, 96);
+    lv_obj_add_flag(g_stk_time, LV_OBJ_FLAG_HIDDEN);
 
     g_stk_loading = lv_label_create(g_stk_card);
     lv_obj_set_style_text_font(g_stk_loading, &lv_font_chinese_14, 0);
@@ -436,8 +501,10 @@ void ui_clock_init(lv_obj_t *parent, lv_obj_t *status_bar)
 
     add_corner_rivets(env, 3);
 
-    /* ---- 底部右：法语学习卡（原摄像头缩略位置 196,122 200x150，8-13 起改为法语学习） ---- */
-    build_fr_learn_card(parent, 196, 122, 200, 150);
+    /* ---- 底部右：法语学习卡（原摄像头缩略位置，8-13 起改为法语学习）
+     * 8-17：行情卡加高后下移至 y=133（顶距行情卡底 127 为 6px），
+     * 高 143 → 底 276 与左下天气卡(165+111)底部对齐。 */
+    build_fr_learn_card(parent, 196, 133, 200, 143);
 
     /* 定时器（运行于 LVGL 任务内，独占 I²C 总线） */
     lv_timer_create(clock_tick_cb, 1000, NULL);
@@ -527,14 +594,22 @@ void ui_clock_set_stocks(const char *names[3], const float values[3],
                          const float pcts[3], const bool ups[3])
 {
     for (int i = 0; i < STOCK_ROWS; ++i) {
-        if (names && names[i]) {
+        /* 仅当本行有有效名称时才整体更新 —— 部分成功（源只返回 N<4 行）时
+         * 缺失行保留旧名旧值，避免 AI 等行被清成 0.00 假数据（8-17 修复） */
+        if (names && names[i] && names[i][0]) {
             snprintf(g_stk_name[i], sizeof(g_stk_name[i]), "%s", names[i]);
+            if (values) g_stk_value[i] = values[i];
+            if (pcts)   g_stk_pct[i]   = pcts[i];
+            if (ups)    g_stk_up[i]    = ups[i];
         }
-        if (values) g_stk_value[i] = values[i];
-        if (pcts)   g_stk_pct[i]   = pcts[i];
-        if (ups)    g_stk_up[i]    = ups[i];
     }
     g_stk_valid = true;
+}
+
+/* 记录最近一次成功刷新时刻（Unix 秒）。仅写 volatile，任意任务可安全调用 */
+void ui_clock_set_stocks_time(uint32_t ts)
+{
+    g_stk_last_ts = ts;
 }
 
 /* ============================================================
@@ -548,6 +623,7 @@ void ui_clock_update_stocks(void)
 
     if (!g_stk_valid) {
         lv_obj_clear_flag(g_stk_loading, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(g_stk_time, LV_OBJ_FLAG_HIDDEN);
         for (int i = 0; i < STOCK_ROWS; ++i)
             lv_obj_add_flag(g_stk_bg[i], LV_OBJ_FLAG_HIDDEN);
         return;
@@ -555,25 +631,80 @@ void ui_clock_update_stocks(void)
 
     lv_obj_add_flag(g_stk_loading, LV_OBJ_FLAG_HIDDEN);
     for (int i = 0; i < STOCK_ROWS; ++i) {
-        char buf[64];
-        /* 无箭头，靠反显/普通区分涨跌；名称左对齐 4 字符，点位固定宽度 9.2f，百分比 6.2f% */
-        snprintf(buf, sizeof(buf), "%-4s %9.2f %6.2f%%",
-                 g_stk_name[i][0] ? g_stk_name[i] : "--",
-                 g_stk_value[i],
+        /* 三列独立 label：名称左对齐、点位/百分比右对齐 → 竖列跨行严格对齐 */
+        char nbuf[16], vbuf[16], pbuf[16];
+        snprintf(nbuf, sizeof(nbuf), "%s", g_stk_name[i][0] ? g_stk_name[i] : "--");
+        snprintf(vbuf, sizeof(vbuf), "%.2f", g_stk_value[i]);
+        snprintf(pbuf, sizeof(pbuf), "%.2f%%",
                  g_stk_pct[i] < 0 ? -g_stk_pct[i] : g_stk_pct[i]);
-        lv_label_set_text(g_stk_text[i], buf);
+        lv_label_set_text(g_stk_name_lb[i], nbuf);
+        lv_label_set_text(g_stk_val_lb[i],  vbuf);
+        lv_label_set_text(g_stk_pct_lb[i],  pbuf);
 
         /* 上涨：底条容器黑底白字（黑底宽度 = 容器宽 146 全宽，左右各留 12px 对称）；
          * 下跌：底条容器透明底黑字 */
         if (g_stk_up[i]) {
             lv_obj_set_style_bg_color(g_stk_bg[i], lv_color_black(), 0);
             lv_obj_set_style_bg_opa(g_stk_bg[i], LV_OPA_COVER, 0);
-            lv_obj_set_style_text_color(g_stk_text[i], lv_color_white(), 0);
+            lv_obj_set_style_text_color(g_stk_name_lb[i], lv_color_white(), 0);
+            lv_obj_set_style_text_color(g_stk_val_lb[i],  lv_color_white(), 0);
+            lv_obj_set_style_text_color(g_stk_pct_lb[i],  lv_color_white(), 0);
         } else {
             lv_obj_set_style_bg_opa(g_stk_bg[i], LV_OPA_TRANSP, 0);
-            lv_obj_set_style_text_color(g_stk_text[i], lv_color_black(), 0);
+            lv_obj_set_style_text_color(g_stk_name_lb[i], lv_color_black(), 0);
+            lv_obj_set_style_text_color(g_stk_val_lb[i],  lv_color_black(), 0);
+            lv_obj_set_style_text_color(g_stk_pct_lb[i],  lv_color_black(), 0);
         }
         lv_obj_clear_flag(g_stk_bg[i], LV_OBJ_FLAG_HIDDEN);
+    }
+
+    /* 右下角刷新时间：MM-DD HH:MM（与天气卡获取时间同格式）。仅当 NTP 已同步（年份 >= 2025）才显示 */
+    if (g_stk_last_ts) {
+        time_t ts = (time_t)g_stk_last_ts;
+        struct tm tmv;
+        localtime_r(&ts, &tmv);
+        if (tmv.tm_year >= 125) {
+            char tbuf[16];
+            snprintf(tbuf, sizeof(tbuf), "%02d-%02d %02d:%02d",
+                     tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour, tmv.tm_min);
+            lv_label_set_text(g_stk_time, tbuf);
+            lv_obj_clear_flag(g_stk_time, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
+
+/* ============================================================
+ *  状态栏摄像头状态：online=实心点 / stale=空心圈 / offline=CAM 反显
+ *  （复用 cam_client 三态，无实测帧率，全局常驻）
+ * ============================================================ */
+static void update_cam_status(void)
+{
+    if (!g_cam_status || !g_cam_dot) return;
+
+    bool fresh = cam_client_is_fresh();
+    bool has   = cam_client_has_frame();
+
+    if (fresh) {
+        /* 在线：CAM 黑字 + 实心黑点 */
+        lv_obj_set_style_bg_opa(g_cam_status, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_text_color(g_cam_status, lv_color_black(), 0);
+        lv_obj_set_style_bg_opa(g_cam_dot, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(g_cam_dot, 0, 0);
+    } else if (has) {
+        /* 陈旧（拉过帧但停更）：CAM 黑字 + 空心圈 */
+        lv_obj_set_style_bg_opa(g_cam_status, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_text_color(g_cam_status, lv_color_black(), 0);
+        lv_obj_set_style_bg_opa(g_cam_dot, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_color(g_cam_dot, lv_color_black(), 0);
+        lv_obj_set_style_border_width(g_cam_dot, 1, 0);
+    } else {
+        /* 离线：CAM 黑底白字反显 + 空心圈 */
+        lv_obj_set_style_bg_opa(g_cam_status, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(g_cam_status, lv_color_black(), 0);
+        lv_obj_set_style_text_color(g_cam_status, lv_color_white(), 0);
+        lv_obj_set_style_bg_opa(g_cam_dot, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_color(g_cam_dot, lv_color_black(), 0);
+        lv_obj_set_style_border_width(g_cam_dot, 1, 0);
     }
 }
 
@@ -584,6 +715,7 @@ static void clock_tick_cb(lv_timer_t *t)
 {
     (void)t;
     rtc_process_pending();   /* 若 NTP 已同步，先把系统时间写入 RTC */
+    update_cam_status();     /* 摄像头状态栏指示（三态） */
 
     struct tm tm;
     bool ok = rtc_read_time(&tm);
@@ -660,30 +792,26 @@ static void env_tick_cb(lv_timer_t *t)
 
 /* ============================================================
  *  法语学习卡（右下，替代原摄像头缩略）
- *  - 每次随机取两条不重复的法语句子（法文 + 中文翻译）
- *  - 5 分钟定时器（fr_learn_cb）重新随机
- *  - 词库：french_lib（SD /sdcard/french.txt 优先，内置 100 句兜底）
+ *  - 一组完整对话同屏双语：A 法语 / A 中文 / 分隔线 / B 法语 / B 中文
+ *  - 5 分钟定时器（fr_learn_cb）随机换一组
+ *  - 词库：french_lib（内置 200 组对话，见 french_dialogues.h）
+ *  - 字体：14px（chinese_14），法文最多 2 行、中文单行
  * ============================================================ */
 static void fr_learn_pick(void)
 {
     if (!g_fr_card) return;
     uint16_t total = french_lib_count();
-    if (total < 2) return;
+    if (total == 0) return;
 
-    /* 两条不重复的随机索引：i2 在 [0,total-1) 取值，≥i1 时 +1 避开 i1 */
-    uint16_t i1 = (uint16_t)(esp_random() % total);
-    uint16_t i2 = (uint16_t)(esp_random() % (total - 1));
-    if (i2 >= i1) i2++;
-    g_fr_idx1 = i1;
-    g_fr_idx2 = i2;
+    uint16_t i = (uint16_t)(esp_random() % total);
 
-    const char *fr = NULL, *cn = NULL;
-    french_lib_get(i1, &fr, &cn);
-    lv_label_set_text(g_fr_t1, fr ? fr : "");
-    lv_label_set_text(g_fr_c1, cn ? cn : "");
-    french_lib_get(i2, &fr, &cn);
-    lv_label_set_text(g_fr_t2, fr ? fr : "");
-    lv_label_set_text(g_fr_c2, cn ? cn : "");
+    french_dialogue_t d;
+    if (!french_lib_get(i, &d)) return;
+
+    lv_label_set_text(g_fr_a,  d.a_fr ? d.a_fr : "");
+    lv_label_set_text(g_fr_ac, d.a_cn ? d.a_cn : "");
+    lv_label_set_text(g_fr_b,  d.b_fr ? d.b_fr : "");
+    lv_label_set_text(g_fr_bc, d.b_cn ? d.b_cn : "");
 }
 
 static void fr_learn_cb(lv_timer_t *t)
@@ -692,7 +820,7 @@ static void fr_learn_cb(lv_timer_t *t)
     fr_learn_pick();
 }
 
-/* 构建卡片：两条（法文可换行两行 + 中文单行），无标题（8-13 用户要求去掉"法语学习"） */
+/* 构建卡片：一组对话同屏双语（14px；单色屏无灰阶，全部纯黑） */
 static void build_fr_learn_card(lv_obj_t *parent, lv_coord_t x, lv_coord_t y,
                                 lv_coord_t w, lv_coord_t h)
 {
@@ -704,38 +832,53 @@ static void build_fr_learn_card(lv_obj_t *parent, lv_coord_t x, lv_coord_t y,
     lv_obj_set_style_border_color(g_fr_card, lv_color_black(), 0);
     lv_obj_set_style_border_width(g_fr_card, 2, 0);
     lv_obj_set_style_radius(g_fr_card, 10, 0);
-    lv_obj_set_style_pad_all(g_fr_card, 6, 0);
+    lv_obj_set_style_pad_all(g_fr_card, 4, 0);
     lv_obj_clear_flag(g_fr_card, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_coord_t iw = w - 12;   /* 内容宽（去掉 2px 边框 + 6px pad*2） */
+    lv_coord_t iw = w - 2 * 2 - 2 * 4;   /* 内容宽 = w - 2*边框 - 2*内边距 = 188 */
 
-    g_fr_t1 = cn_label(g_fr_card, "");
-    lv_obj_set_style_text_font(g_fr_t1, &lv_font_chinese_14, 0);
-    lv_obj_set_width(g_fr_t1, iw);
-    lv_obj_set_height(g_fr_t1, 38);                     /* 法语可换行两行 */
-    lv_label_set_long_mode(g_fr_t1, LV_LABEL_LONG_WRAP);
-    lv_obj_set_pos(g_fr_t1, 0, 4);
+    /* A 句法语：14px，可换行两行（行高 15）；卡片 143 高内容区 131，
+     * 内容整体 y+7 垂直居中（内容 4..112 → 11..119） */
+    g_fr_a = lv_label_create(g_fr_card);
+    lv_obj_set_style_text_font(g_fr_a, &lv_font_chinese_14, 0);
+    lv_obj_set_style_text_color(g_fr_a, lv_color_black(), 0);
+    lv_obj_set_width(g_fr_a, iw);
+    lv_obj_set_height(g_fr_a, 30);
+    lv_label_set_long_mode(g_fr_a, LV_LABEL_LONG_WRAP);
+    lv_obj_set_pos(g_fr_a, 0, 11);
 
-    g_fr_c1 = cn_label(g_fr_card, "");
-    lv_obj_set_style_text_font(g_fr_c1, &lv_font_chinese_14, 0);
-    lv_obj_set_style_text_opa(g_fr_c1, LV_OPA_80, 0);
-    lv_obj_set_width(g_fr_c1, iw);
-    lv_label_set_long_mode(g_fr_c1, LV_LABEL_LONG_DOT);
-    lv_obj_set_pos(g_fr_c1, 0, 44);
+    /* A 句中文：14px，单行（超长省略兜底） */
+    g_fr_ac = lv_label_create(g_fr_card);
+    lv_obj_set_style_text_font(g_fr_ac, &lv_font_chinese_14, 0);
+    lv_obj_set_style_text_color(g_fr_ac, lv_color_black(), 0);
+    lv_obj_set_width(g_fr_ac, iw);
+    lv_label_set_long_mode(g_fr_ac, LV_LABEL_LONG_DOT);
+    lv_obj_set_pos(g_fr_ac, 0, 45);
 
-    g_fr_t2 = cn_label(g_fr_card, "");
-    lv_obj_set_style_text_font(g_fr_t2, &lv_font_chinese_14, 0);
-    lv_obj_set_width(g_fr_t2, iw);
-    lv_obj_set_height(g_fr_t2, 38);
-    lv_label_set_long_mode(g_fr_t2, LV_LABEL_LONG_WRAP);
-    lv_obj_set_pos(g_fr_t2, 0, 66);
+    /* A/B 分隔线（纯黑 1px） */
+    g_fr_sep = lv_obj_create(g_fr_card);
+    lv_obj_remove_style_all(g_fr_sep);
+    lv_obj_set_size(g_fr_sep, iw, 1);
+    lv_obj_set_pos(g_fr_sep, 0, 64);
+    lv_obj_set_style_bg_color(g_fr_sep, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(g_fr_sep, LV_OPA_COVER, 0);
 
-    g_fr_c2 = cn_label(g_fr_card, "");
-    lv_obj_set_style_text_font(g_fr_c2, &lv_font_chinese_14, 0);
-    lv_obj_set_style_text_opa(g_fr_c2, LV_OPA_80, 0);
-    lv_obj_set_width(g_fr_c2, iw);
-    lv_label_set_long_mode(g_fr_c2, LV_LABEL_LONG_DOT);
-    lv_obj_set_pos(g_fr_c2, 0, 106);
+    /* B 句法语 */
+    g_fr_b = lv_label_create(g_fr_card);
+    lv_obj_set_style_text_font(g_fr_b, &lv_font_chinese_14, 0);
+    lv_obj_set_style_text_color(g_fr_b, lv_color_black(), 0);
+    lv_obj_set_width(g_fr_b, iw);
+    lv_obj_set_height(g_fr_b, 30);
+    lv_label_set_long_mode(g_fr_b, LV_LABEL_LONG_WRAP);
+    lv_obj_set_pos(g_fr_b, 0, 70);
+
+    /* B 句中文 */
+    g_fr_bc = lv_label_create(g_fr_card);
+    lv_obj_set_style_text_font(g_fr_bc, &lv_font_chinese_14, 0);
+    lv_obj_set_style_text_color(g_fr_bc, lv_color_black(), 0);
+    lv_obj_set_width(g_fr_bc, iw);
+    lv_label_set_long_mode(g_fr_bc, LV_LABEL_LONG_DOT);
+    lv_obj_set_pos(g_fr_bc, 0, 104);
 
     fr_learn_pick();
 }
