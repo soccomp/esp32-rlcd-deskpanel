@@ -113,8 +113,29 @@ static char *maybe_gunzip(const String &payload)
 /* 解析和风 JSON（daily 数组或后端代理的扁平字段）→ 更新天气卡。成功返回 true。 */
 static bool apply_qh_payload(const char *json_str)
 {
+    /* ★ 8-18：直连和风返回的 7 天预报解压后实测 31040 字节（日志
+     * "[weather] gzip 586 -> 31040 bytes"），远超原先 DynamicJsonDocument(3072)
+     * → 直连路径永远 NoMemory 解析失败、只能回退 M1 后端代理（功能看似正常，
+     * 实则白连一次且仍依赖 M1）。不能简单把 doc 开到 40KB：堆只剩 ~104KB，
+     * 一次性大块分配容易碰上碎片。改用 ArduinoJson 的 Filter：解析时就丢掉
+     * 不需要的字段，只保留 daily[].textDay/tempMax/tempMin 与后端代理的扁平
+     * 字段，3072 字节足够，且堆占用与响应大小解耦。
+     * 注意 filter 里数组用 [0] 作为"所有元素"的模板（ArduinoJson 6 语义）。 */
+    StaticJsonDocument<384> filter;
+    filter["daily"][0]["textDay"] = true;
+    filter["daily"][0]["tempMax"] = true;
+    filter["daily"][0]["tempMin"] = true;
+    /* 后端代理 /api/weather_qh 的扁平字段（走回退路径时用） */
+    filter["today_text"]    = true;
+    filter["tomorrow_text"] = true;
+    filter["today_high"]    = true;
+    filter["today_low"]     = true;
+    filter["tomorrow_high"] = true;
+    filter["tomorrow_low"]  = true;
+
     DynamicJsonDocument doc(3072);
-    DeserializationError werr = deserializeJson(doc, json_str);
+    DeserializationError werr = deserializeJson(doc, json_str,
+                                    DeserializationOption::Filter(filter));
     if (werr != DeserializationError::Ok) {
         Serial.printf("Weather JSON parse error: %s\n", werr.c_str());
         return false;
@@ -188,6 +209,23 @@ static bool fetch_backend_qh(void)
     return false;
 }
 
+/* ★ 8-18 socket 泄漏根治：TLS 客户端改为函数内静态单例。
+ * 旧实现在 TLS 连接失败时用 `client = nullptr` 泄漏对象来躲避析构 PANIC
+ * （start_ssl_client:-1 后析构偶发崩溃）。但注释低估了代价——泄漏的不只是
+ * ~KB 级内存，更致命的是那个 socket fd / lwIP TCP PCB 永不归还。
+ * ESP32 CONFIG_LWIP_MAX_SOCKETS = 16：攒满 16 个泄漏 socket 后，本机所有
+ * TCP 出站 connect 与入站 accept 全部失败，而 ICMP 不占 socket 所以 ping
+ * 依旧完美 → 表现为"WiFi 显示已连接、ping 0 丢包，但取流全失败、:8771 也死"，
+ * WiFi.reconnect() 救不回来（重连不释放 PCB），只有 esp_restart 能清空
+ * → 面板每 30~60 秒楔死自重启一轮。
+ * 正解：静态单例永不析构（规避 PANIC），每次使用前与失败后显式 stop()
+ * 关闭 socket，PCB 立即归还 → 零泄漏且不崩。 */
+static WiFiClientSecure &weather_tls_client(void)
+{
+    static WiFiClientSecure inst;
+    return inst;
+}
+
 /* 直连和风天气，解析后写入天气卡缓存（本函数内部自管 Lvgl_lock 用于刷新） */
 weather_result_t fetch_weather_data(void)
 {
@@ -196,9 +234,9 @@ weather_result_t fetch_weather_data(void)
         return WEATHER_RETRYABLE;
     }
 
-    /* HTTPS：跳过证书校验（setInsecure）足够桌面板场景 */
-    WiFiClientSecure *client = new WiFiClientSecure;
-    if (!client) { Serial.println("Weather OOM"); return WEATHER_RETRYABLE; }
+    WiFiClientSecure &client = weather_tls_client();
+    client.stop();           /* 归还上一轮可能残留的 socket */
+    client.setInsecure();    /* ★ 补齐：原代码只有注释没调用，导致直连 TLS 必失败 */
     bool success = false;
     weather_result_t result = WEATHER_RETRYABLE;
 
@@ -211,16 +249,12 @@ weather_result_t fetch_weather_data(void)
 
     /* 先显式建立 TLS 连接（带超时）：BTWIFI6 网络出站 HTTPS 可能被 RST，
      * 若交给 HTTPClient 内部连接，无超时会无限阻塞。 */
-    bool conn_ok = client->connect(WEATHER_API_HOST, 443, 8000);
+    bool conn_ok = client.connect(WEATHER_API_HOST, 443, 8000);
     if (conn_ok) {
-        http.begin(*client, url);   /* 复用已连接 socket */
+        http.begin(client, url);   /* 复用已连接 socket */
     } else {
         Serial.printf("[weather] connect fail, fallback backend\n");
-        /* 8-12 崩溃修复：连接失败后 **不 delete client**——WiFiClientSecure 在
-         * TLS 握手失败（start_ssl_client:-1）后的析构偶发 PANIC（reset reason 4，
-         * 每次重启->WiFi 连上->天气刷新即复现）。泄漏一个 client 对象（~KB 级），
-         * 天气失败有指数退避（2^n 分钟），重启清零，远好于崩溃。 */
-        client = nullptr;
+        client.stop();   /* ★ 必须 stop：释放握手失败残留的 socket / TCP PCB */
     }
     http.setTimeout(8000);
     http.setUserAgent("ESP32-RLCD-DeskPanel");
@@ -271,7 +305,7 @@ weather_result_t fetch_weather_data(void)
         }
     }
 
-    if (client) { delete client; }   /* 仅连接成功才析构（失败路径已置空，防 PANIC） */
+    client.stop();   /* 静态单例：只关 socket 不析构，PCB 归还且不触发 PANIC */
     if (success) return WEATHER_OK;
     return result;   /* 保留永久/可恢复分类 */
 }

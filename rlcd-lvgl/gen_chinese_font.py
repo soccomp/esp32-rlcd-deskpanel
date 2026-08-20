@@ -33,10 +33,16 @@ WEATHER_CHARS = (
     "北京上海广州深圳杭州成都西安武汉南廊坊城市~°"
 )
 
+# 0.5) 全角标点兜底：法语对话卡等动态文案会用到全角标点（如 ？ ！），
+# 它们不在 FALLBACK_RANGES 的 CJK/拉丁范围内，必须显式并入，否则显示方框。
+FULLWIDTH_PUNCT = "，。！？：；、（）《》〈〉【】「」『』—…·“”‘’"
+
 # 1) 收集字表
-texts = [WEATHER_CHARS]
-with open(os.path.join(ROOT, "schedule.json"), encoding="utf-8") as f:
-    texts.append(f.read())
+texts = [WEATHER_CHARS, FULLWIDTH_PUNCT]
+_sched = os.path.join(ROOT, "schedule.json")
+if os.path.exists(_sched):   # 会议页已移除，schedule.json 可能不存在，容错跳过
+    with open(_sched, encoding="utf-8") as f:
+        texts.append(f.read())
 for ext in ("*.cpp", "*.h"):
     for p in glob.glob(os.path.join(ROOT, "src", ext)):
         with open(p, encoding="utf-8") as f:

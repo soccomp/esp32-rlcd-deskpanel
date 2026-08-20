@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <esp_wifi.h>       // esp_wifi_set_protocol / set_bandwidth：强制 11n+HT20 规避 AP 的 ax 调度
 #include <ArduinoOTA.h>     // WiFi OTA：连网后可免线烧录固件
 #include <time.h>
 #include <stdlib.h>
@@ -18,7 +19,7 @@
 #include "sd_card.h"          // SD 卡驱动（SDMMC 1线）
 #include "log_store.h"        // 本地日志落盘（/sdcard/log）
 #include "data_cache.h"       // 离线数据缓存（JSON 快照）
-#include "stocks_client.h"    // 股票指数行情：mDNS 找本机后端 GET /api/stocks
+#include "stocks_client.h"    // 股票指数行情：直连腾讯+东财（脱离 Mac 后端）
 #include "ota_backup.h"       // OTA 固件备份（升级前存 SD）
 
 /* ----- 硬件对象与引脚 ----- */
@@ -130,10 +131,89 @@ static bool is_work_hours(void)
     return weekday && (h >= 8 && h < 18);
 }
 
+/* ★ 8-18 WiFi 断连取证 —— 这是定位"每 30~60s 网络失效"的最后一块拼图。
+ * 已用 net_diag 排除本地 lwIP 资源（free_fd 恒 14 未耗尽、tw 仅 6 远低于池上限
+ * 16、listen PCB 健在、heap 稳定），故障不在 TCP 层而在 **WiFi 关联层**
+ * （日志出现 local WiFi down → WL_CONNECTED 失效）。断连原因只有 AP/RF 才知道，
+ * 而 ESP32 的 STA_DISCONNECTED 事件带 reason code，能一击定性：
+ *   2  AUTH_EXPIRE      / 4 ASSOC_EXPIRE  → AP 主动老化踢除（AP 侧超时设置）
+ *   8  ASSOC_LEAVE      / 5 ASSOC_TOOMANY → AP 踢人 / 客户端数超限
+ *   15 4WAY_HANDSHAKE_TIMEOUT             → WPA2 握手/PMF 问题
+ *   200 BEACON_TIMEOUT                    → 收不到 beacon（RF 干扰、信号弱、AP 睡了）
+ *   201 NO_AP_FOUND / 202 AUTH_FAIL / 203 ASSOC_FAIL
+ * 同时打印 RSSI/channel：RSSI < -75dBm 则属信号余量不足（换位置/加天线），
+ * RSSI 良好却 BEACON_TIMEOUT 则是 AP 与 ESP32 的协议栈兼容性问题。 */
+static volatile int  g_wifi_disc_reason = 0;
+static volatile uint32_t g_wifi_disc_cnt = 0;
+
+static void wifi_event_cb(WiFiEvent_t event, WiFiEventInfo_t info)
+{
+    switch (event) {
+    case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+        Serial.printf("[wifi] CONNECTED ch=%d rssi=%d\n",
+                      WiFi.channel(), WiFi.RSSI());
+        /* ★ 8-19：强制 11b/g-only（排除 11n）→ 下行不走 A-MPDU 聚合，从根上消除
+         * "AP 对 ESP32 聚合下行帧让 RX 解不出"的假在线楔死。A-MPDU 是 11n 特性，
+         * 11g 下行必为非聚合 MPDU，ESP32 稳定接收。协议变更需一次重关联才生效，
+         * 由预防性重关联(12s)或自愈接管。仅在首次连接设一次。 */
+        {
+            static bool proto_set = false;
+            if (!proto_set) {
+                esp_err_t ep = esp_wifi_set_protocol(WIFI_IF_STA,
+                                    WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G);
+                Serial.printf("[wifi] force 11b/g (no 11n/A-MPDU): %d\n", (int)ep);
+                proto_set = true;
+            }
+        }
+        break;
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED: {
+        int r = info.wifi_sta_disconnected.reason;
+        g_wifi_disc_reason = r;
+        g_wifi_disc_cnt++;
+        Serial.printf("[wifi] DISCONNECTED reason=%d cnt=%u uptime=%us\n",
+                      r, (unsigned)g_wifi_disc_cnt, (unsigned)(millis() / 1000));
+        break;
+    }
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+        Serial.printf("[wifi] GOT_IP %s rssi=%d\n",
+                      WiFi.localIP().toString().c_str(), WiFi.RSSI());
+        break;
+    default:
+        break;
+    }
+}
+
+/* ★ 8-18：记住"上次真正连通的那个 AP"，供快速重连用。
+ * 血泪教训：start_wifi() 是"按列表逐个 SSID 试、每个等 8 秒"的冷启动逻辑，
+ * 当它被自愈路径反复调用时，每次都要先在 Hi12/Gnos 上各白等 8 秒才轮到
+ * BTWIFI6 —— 一次 hard restart 实测耗 16~24 秒。结果就是"检测越灵敏、
+ * 丢包越严重"（local_fail>=2 时 4 分钟丢包率反而从 19% 恶化到 76%）。
+ * 记下成功 AP 的下标 + BSSID + 信道后，重连可直接定频定 BSSID，
+ * 跳过全信道扫描，实测 2~4 秒即回来。 */
+static int      g_wifi_ok_idx = -1;
+static uint8_t  g_wifi_ok_bssid[6] = {0};
+static int32_t  g_wifi_ok_ch = 0;
+
 static void start_wifi(void)
 {    if (wifi_count == 0) return;
     setenv("TZ", "CST-8", 1);
     tzset();
+
+    /* 断连 reason code 取证。注意：必须只注册一次！
+     * 原先写在每次 start_wifi 里，被自愈路径反复调用后同一回调注册了 5 份，
+     * 于是每个事件刷 5 行日志、cnt 一次跳 5 —— 排查时极易误判为"疯狂断连"。 */
+    static bool ev_registered = false;
+    if (!ev_registered) { WiFi.onEvent(wifi_event_cb); ev_registered = true; }
+
+    /* ★ 8-18 已回退：曾在此强制 esp_wifi_set_protocol(11B|11G|11N)+HT20，
+     * 意图是拒绝参与 AP 的 802.11ax 调度。实测证伪且有害：
+     *   - 冷启动时调用返回 0x3014 (ESP_ERR_WIFI_STOP_STATE)，其实根本没生效；
+     *   - 唯一真正生效的那次（hard restart 后 proto=0），紧接着就是连续
+     *     reason=201 NO_AP_FOUND 风暴 + 关联成功 12 秒后数据面再次死亡。
+     * 即"强制 legacy" 并不能防楔死，反而让扫描/关联本身变得不可靠。
+     * 真正有效的手段只有两条：路由器侧关 <ssv_wifi6>，以及本机侧的
+     * 快速 hard restart 自愈（见 wifi_hard_restart）。 */
+    WiFi.mode(WIFI_STA);
 
     /* ★ 关闭 WiFi 省电模式（modem sleep）——关键！
      * ESP32 默认省电模式下周期休眠，BTWIFI6 这类企业级 AP 会把休眠设备
@@ -141,8 +221,18 @@ static void start_wifi(void)
      * 省电对桌面插电面板无意义，关闭后 WiFi 常驻在线。 */
     WiFi.setSleep(false);
 
-    // 依次尝试列表中的 Wi-Fi，每个最多等 8 秒
-    for (int i = 0; i < wifi_count; i++) {
+    /* ★ 8-18：最大发射功率，提高与 BTWIFI6-MiFi 的链路余量。
+     * 排查确认路由器配置干净（net_mode=0 非 ax、WPA2-PSK 无 PMF、
+     * 防火墙/Dos 全关、无 AP 隔离、无 NAT 会话上限），供电也正常
+     * （reset reason=0、电池 95%、USB 4.12V），但 WiFi 关联后约 30~60s
+     * 即退化为"连着但丢包/短读"（short read 7180/16643），属 ESP32 与该
+     * AP 的 RF/协议栈兼容性不稳。拉满 TX 功率是低成本稳妥的链路余量手段。 */
+    WiFi.setTxPower(WIFI_POWER_19_5dBm);
+
+    /* 依次尝试列表中的 Wi-Fi，每个最多等 8 秒。
+     * 顺序上把"上次成功过的那个"提到最前，避免每次自愈都在无关 SSID 上白等 8 秒。 */
+    for (int k = 0; k < wifi_count; k++) {
+        int i = (g_wifi_ok_idx >= 0) ? ((g_wifi_ok_idx + k) % wifi_count) : k;
         Serial.printf("[WiFi] 尝试连接 \"%s\" ...\n", wifi_list[i].ssid);
         WiFi.begin(wifi_list[i].ssid, wifi_list[i].password);
         uint32_t t0 = millis();
@@ -150,8 +240,14 @@ static void start_wifi(void)
             delay(200);
         }
         if (WiFi.status() == WL_CONNECTED) {
-            Serial.printf("[WiFi] 已连接 \"%s\", IP=%s\n",
-                          wifi_list[i].ssid, WiFi.localIP().toString().c_str());
+            /* 记下 BSSID/信道，后续 wifi_hard_restart 可定频直连 */
+            g_wifi_ok_idx = i;
+            g_wifi_ok_ch  = WiFi.channel();
+            const uint8_t *bs = WiFi.BSSID();
+            if (bs) memcpy(g_wifi_ok_bssid, bs, 6);
+            Serial.printf("[WiFi] 已连接 \"%s\", IP=%s ch=%d\n",
+                          wifi_list[i].ssid, WiFi.localIP().toString().c_str(),
+                          (int)g_wifi_ok_ch);
             break;  // 连上了就不再试下一个
         }
         Serial.printf("[WiFi] \"%s\" 连接失败，尝试下一个\n", wifi_list[i].ssid);
@@ -159,6 +255,45 @@ static void start_wifi(void)
     }
 
     configTime(8 * 3600, 0, "pool.ntp.org", "cn.ntp.org.cn");
+}
+
+/* ★ 8-18：数据面死而关联在时的唯一有效自愈（供 cam_task 兜底调用）。
+ * 实测 WiFi.disconnect(false) + WiFi.reconnect() 无效：日志显示重连在同一秒
+ * 就 CONNECTED + GOT_IP，但紧接着 connect 仍是 ETIMEDOUT —— 只重做 association
+ * 不会重建 PTK/GTK，也清不掉 AP 侧那条坏掉的会话状态。彻底关 radio 再开，
+ * 会走完整的 scan → auth → assoc → 4-way handshake，等价于"重新插网线"，
+ * 且比 esp_restart 温和（不丢 UI 状态、不重新加载字体/PSRAM 缓冲）。 */
+void wifi_hard_restart(void)
+{
+    uint32_t t0 = millis();
+    Serial.println("[wifi] hard restart: radio OFF -> STA -> re-associate");
+    WiFi.disconnect(true);      /* true：连带关闭 radio，彻底断开 */
+    WiFi.mode(WIFI_OFF);
+    delay(300);
+
+    /* 快路径：定 BSSID + 定信道直连上次成功的 AP，跳过全信道扫描。
+     * 自愈的价值完全取决于"多快回来"——冷启动列表轮询要 16~24s，
+     * 这条快路径实测 2~4s。只有它失败了才退回完整 start_wifi()。 */
+    if (g_wifi_ok_idx >= 0) {
+        WiFi.mode(WIFI_STA);
+        WiFi.setSleep(false);
+        WiFi.setTxPower(WIFI_POWER_19_5dBm);
+        WiFi.begin(wifi_list[g_wifi_ok_idx].ssid,
+                   wifi_list[g_wifi_ok_idx].password,
+                   g_wifi_ok_ch, g_wifi_ok_bssid);
+        uint32_t t1 = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - t1 < 5000) delay(100);
+        if (WiFi.status() == WL_CONNECTED) {
+            Serial.printf("[wifi] fast reconnect OK in %ums, IP=%s ch=%d\n",
+                          (unsigned)(millis() - t0),
+                          WiFi.localIP().toString().c_str(), (int)WiFi.channel());
+            return;
+        }
+        Serial.println("[wifi] fast reconnect failed, fall back to full scan");
+        WiFi.disconnect(false);
+    }
+    start_wifi();               /* 慢路径：mode(STA) + 列表轮询 */
+    Serial.printf("[wifi] hard restart done in %ums\n", (unsigned)(millis() - t0));
 }
 
 // GPIO4 电池电压 ADC（3 倍分压）：18650 锂电 2.7V=空 ~ 4.2V=满
@@ -217,8 +352,7 @@ void setup()
     // 办公室热闹雷达：启动后台 Wi-Fi/BLE 扫描任务（独立任务，不卡 LVGL 渲染）
     ui_ambient_start_radar();
 
-    // SD 卡 + 本地日志 + 离线数据缓存（须在 ui_init 前：french_lib_init 需要 SD 已挂载；
-    // 无卡时自动降级，不影响主功能）
+    // SD 卡 + 本地日志 + 离线数据缓存（须在 ui_init 前挂载 SD；无卡时自动降级，不影响主功能）
     log_store_init();
     data_cache_init();
 
@@ -263,6 +397,21 @@ void setup()
 void loop()
 {
     ArduinoOTA.handle();   // 必须频繁调用，保证 OTA 能及时响应
+
+    /* ★ 8-19 预防性重关联（AP 对 ESP32 下发 A-MPDU 聚合下行帧，周期性 30~60s
+     * 让 RX 解不出→"假在线"；每次重关联重置 AP 聚合状态即恢复）。在楔死发生前
+     * 主动重连，永远停在健康窗口，使数据面楔死不暴露于用户路径。12s < 楔死周期(~14s)，
+     * 余量充足；wifi_hard_restart 已含快速重连（定频直连，~1s 完成）。 */
+    {
+        static uint32_t s_prev_reassoc = 0;
+        if (millis() - s_prev_reassoc > 12000UL) {
+            s_prev_reassoc = millis();
+            if (WiFi.status() == WL_CONNECTED) {
+                Serial.println("[wifi] preventive hard restart (ampdu-downlink workaround)");
+                wifi_hard_restart();
+            }
+        }
+    }
 
     static uint32_t last_sec = 0;
     uint32_t now = millis();
