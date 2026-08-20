@@ -379,3 +379,36 @@ currently running on the device. Changes below mirror the local commit
 
 Note: this is a housekeeping sync (user explicitly requested GitHub mirror the running state so
 external AI review reflects current code). No new task is opened; RLCD-004.2 remains the active task.
+
+---
+
+## Addendum 2 (2026-08-20, WorkBuddy) — reproducibility + docs alignment (housekeeping)
+
+User requested a full "GitHub as source of truth" alignment pass. Three commits on top of the
+previous sync (cabada1):
+
+1. `777e863` **sync: align CAM firmware with local runtime (USB full-link video)**
+   - `esp32-cam-fw/src/main.cpp`: enable `uart_frame_task` + `uart_cmd_task` (USB full-link),
+     disable `wifi_reassoc_task` (WiFi kept only for `/status` diag).
+   - `esp32-cam-fw/platformio.ini`: drop `-DCAM_WIFI_ONLY` (serial frame path 1M).
+   - `esp32-cam-fw/finger_page_control.py`: gesture → page mapping sync.
+
+2. `ffccc60` **build: make repository reproducible from a clean checkout**
+   - Removed `rlcd-lvgl/lib/lvgl` symlink (pointed to local absolute path, unusable on clean checkout).
+   - `platformio.ini`: switch LVGL to registry `lvgl/lvgl@8.4.0` + `extra_scripts`.
+   - Added `scripts/patch_lvgl.py`: re-applies the only local LVGL customization (`lv_refr.c` even
+     flush chunk height for ST7305 rotated refresh) after libdeps download. Verified clean-build:
+     `rm -rf .pio/libdeps && pio run` → auto-patch + SUCCESS (Flash 2162097B).
+
+3. `docs` **align architecture documentation with current implementation**
+   - `README.md` / `docs/ARCHITECTURE.md`: 3-page UI (HOME/GUITAR/CAMERA, meeting page removed),
+     200-dialogue French card, USB full-link camera, stocks firmware-direct HTTPS, weather QWeather
+     direct primary, CAM status indicator, gesture page control, 12s wifi_hard_restart.
+   - `PROBLEM.md`: rewritten for the USB full-link camera chain (was WiFi proxy).
+
+**Recorded but NOT fixed in this pass (per user's explicit scope)**: `parse_schedule.py` is absent
+from the repo (referenced by docs/launchd but file deleted from disk; the running launchd process
+holds it in memory — will fail to restart). Mitigation deferred to a future task.
+
+Backup branch `backup/pre-github-sync-20260820` created at `cabada1` before this pass. Pushed to
+`workbuddy-development` without force.
