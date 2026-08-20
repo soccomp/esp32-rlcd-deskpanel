@@ -15,6 +15,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <esp_wifi.h>       // esp_wifi_set_ampdu_rx_enable：关聚合根治 AP 下行假在线
 #include <ESPmDNS.h>
 #include <ArduinoOTA.h>
 #include "esp_camera.h"
@@ -161,6 +162,14 @@ static volatile uint32_t g_last_seq = 0;    /* 递增帧号：>0 即证明有帧
 static volatile uint32_t g_send_seq = 0;    /* staging 帧号（同帧快照） */
 static SemaphoreHandle_t g_frame_mutex = NULL;  /* 保护发布与快照的短临界区 */
 static volatile uint32_t g_last_handle_ms = 0;  /* loop 里 handleClient 心跳 */
+static uint32_t g_prev_reassoc = 0;             /* 8-19 预防性重关联计时 */
+static uint32_t g_last_got_ip  = 0;             /* 8-19 最近一次拿到 IP 的时间戳（卡死探测用） */
+static int g_last_ssid_idx = -1;                /* 8-19 记住上次成功 SSID 索引，硬重启后快速直连 */
+static uint8_t g_wifi_ok_ch  = 0;               /* 8-19 v5: 记住信道，硬重启定频直连 */
+static uint8_t g_wifi_ok_bssid[6] = {0};        /* 8-19 v5: 记住 BSSID，硬重启定频直连 */
+static volatile bool g_reassoc_busy = false;    /* 8-20 v7: 重连任务忙碌标志 */
+
+static void connect_wifi(void);   /* 前置声明：wifi_reassoc_task 用到 */
 static volatile uint32_t g_last_serve_ms  = 0;  /* 最近一次成功响应（/capture 或 /status） */
 
 /* 快照当前最新帧到 staging 缓冲（锁内 memcpy，短临界区；解锁后由调用方发送）。
@@ -213,37 +222,118 @@ static void watchdog_task(void *arg)
 {
     (void)arg;
     for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        vTaskDelay(pdMS_TO_TICKS(1000));
         uint32_t now = millis();
         if (g_last_handle_ms != 0 && (now - g_last_handle_ms) > 15000UL) {
             Serial.println("[WDT] HTTP handler stuck, restarting...");
             esp_restart();
         }
-        if (g_last_serve_ms != 0 && (now - g_last_serve_ms) > 30000UL) {
-            Serial.println("[WDT] no successful serve for 30s, restarting...");
+        if (g_last_serve_ms != 0 && (now - g_last_serve_ms) > 20000UL) {
+            Serial.println("[WDT] no successful serve for 20s, restarting...");
             esp_restart();
         }
     }
 }
 
-/* ================== WiFi 连接 ================== */
+/* ★ 8-20 v7：预防性重关联任务（独立任务，完全复刻 RLCD wifi_hard_restart）。
+ * 每 10s：radio OFF(300ms) → 定 BSSID+信道直连上次 AP（跳过全信道扫描）→
+ * 最多 5s 等 CONNECTED → 失败退回 connect_wifi 全列表。
+ * 在独立任务执行，loop 的 HTTP 服务不受阻塞影响（WiFi 断期间请求失败，
+ * 但重连通常 1~3s 完成，比 v6 非阻塞（实测 5~7s 才回）快得多）。 */
+static void wifi_reassoc_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(10000));   /* 10s 周期，先睡一轮 */
+        if (g_reassoc_busy) continue;
+        g_reassoc_busy = true;
+
+        uint32_t t0 = millis();
+        Serial.println("[WiFi] v7 hard restart: radio OFF -> STA -> re-associate");
+        g_wifi_up = false;
+        WiFi.disconnect(true);      /* true：连带关闭 radio，彻底断开 */
+        WiFi.mode(WIFI_OFF);
+        delay(300);
+
+        WiFi.mode(WIFI_STA);
+        WiFi.setSleep(false);
+        WiFi.setTxPower(WIFI_POWER_19_5dBm);
+        WiFi.config((uint32_t)0, (uint32_t)0, (uint32_t)0);   /* DHCP */
+
+        /* 快路径：定 BSSID + 定信道直连（RLCD 同款，实测 1~3s） */
+        if (g_last_ssid_idx >= 0 && g_last_ssid_idx < wifi_count) {
+            if (g_wifi_ok_ch != 0) {
+                WiFi.begin(wifi_list[g_last_ssid_idx].ssid,
+                           wifi_list[g_last_ssid_idx].password,
+                           g_wifi_ok_ch, g_wifi_ok_bssid);
+            } else {
+                WiFi.begin(wifi_list[g_last_ssid_idx].ssid,
+                           wifi_list[g_last_ssid_idx].password);
+            }
+            uint32_t t1 = millis();
+            while (WiFi.status() != WL_CONNECTED && millis() - t1 < 5000) delay(100);
+            if (WiFi.status() == WL_CONNECTED) {
+                Serial.printf("[WiFi] fast reconnect OK in %ums ch=%d\n",
+                              (unsigned)(millis() - t0), (int)WiFi.channel());
+                g_reassoc_busy = false;
+                continue;
+            }
+            Serial.println("[WiFi] fast reconnect failed, fall back to full scan");
+            WiFi.disconnect(false);
+        }
+        connect_wifi();             /* 慢路径：全列表轮询（会阻塞 8s/SSID） */
+        Serial.printf("[WiFi] v7 hard restart done in %ums\n", (unsigned)(millis() - t0));
+        g_reassoc_busy = false;
+    }
+}
+static void cam_wifi_cb(WiFiEvent_t event) {
+    switch (event) {
+        case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+            WiFi.setSleep(false);
+            esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G);
+            Serial.println("[WiFi] EVENT connected (11b/g forced)");
+            break;
+        case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+            g_wifi_up = true;
+            g_last_got_ip = millis();          /* 8-19 卡死探测：刷新拿 IP 时间 */
+            g_wifi_ok_ch = WiFi.channel();     /* 8-19 v5: 更新定频直连信道 */
+            {
+                const uint8_t *bs = WiFi.BSSID();
+                if (bs) memcpy(g_wifi_ok_bssid, bs, 6);
+            }
+            Serial.printf("[WiFi] EVENT got IP %s\n", WiFi.localIP().toString().c_str());
+            break;
+        case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+            g_wifi_up = false;
+            Serial.println("[WiFi] EVENT disconnected");
+            break;
+        default: break;
+    }
+}
+
 static void connect_wifi(void)
 {
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
+    WiFi.setTxPower(WIFI_POWER_19_5dBm);   /* 8-19 v5: 拉满发射功率，链路余量（同 RLCD） */
+
     for (int i = 0; i < wifi_count; i++) {
         Serial.printf("[WiFi] trying \"%s\" ...\n", wifi_list[i].ssid);
 
-        /* ★ IP 绑定：BTWIFI6（办公室网）用静态 IP，不依赖 DHCP，永不乱跳。
-         * 网关 192.168.100.5 = 办公室 AP 网关（Mac netstat 实测）。
-         * 其余网络显式恢复 DHCP，防止静态配置串网。 */
+        /* ★ IP 策略（2026-08-17 修正）：全部走 DHCP，不再给 BTWIFI6 设静态 IP。
+         *
+         * 故障复盘：之前对 BTWIFI6 调 WiFi.config(192.168.100.199, ...) 静态地址，
+         * 在 AP 从 802.11ax 切到 802.11n 后，ESP32 的 LwIP netif 始终拿不到该静态
+         * IP（卡 0.0.0.0）——表现为 AP 客户端列表"无 IP"、Mac 侧 ping/HTTP 全死、
+         *  ARP 仅靠重启前的陈旧缓存解析。同 AP 上的 RLCD 用纯 DHCP 一直正常，说明
+         *  问题在 camera 的静态 IP 路径，而非 AP 本身。
+         *
+         * 修法：camera 改为 DHCP；AP 端已配置的 MAC(68:09:47:F8:0B:F8)→.199 静态
+         *  绑定本质是 DHCP 地址保留，camera 一发起 DHCP 就会稳拿 .199，AP 客户端列表
+         *  也正常显示 IP，Mac 侧即可访问 http://192.168.100.199/status。 */
+        WiFi.config((uint32_t)0, (uint32_t)0, (uint32_t)0);  /* DHCP（含 BTWIFI6；AP 侧 MAC 绑定保留 .199） */
         if (strcmp(wifi_list[i].ssid, "BTWIFI6-169148") == 0) {
-            IPAddress local_ip(192, 168, 100, 199);
-            IPAddress gateway(192, 168, 100, 5);
-            IPAddress subnet(255, 255, 255, 0);
-            IPAddress dns(192, 168, 100, 5);
-            WiFi.config(local_ip, gateway, subnet, dns);
-            Serial.println("[WiFi] static IP 192.168.100.199 for BTWIFI6");
-        } else {
-            WiFi.config((uint32_t)0, (uint32_t)0, (uint32_t)0);  /* DHCP */
+            Serial.println("[WiFi] BTWIFI6 -> DHCP (AP reserves .199 via MAC binding)");
         }
 
         WiFi.begin(wifi_list[i].ssid, wifi_list[i].password);
@@ -255,9 +345,24 @@ static void connect_wifi(void)
             WiFi.setSleep(false);            /* 关闭 modem sleep：
              * BTWIFI6 等企业 AP 对省电设备有空闲踢除策略，ESP32 周期休眠
              * 会被判定离线踢出 → WiFi 反复掉线 → 画面定格（卡死根因之一）。 */
+            /* ★ 8-19：强制 11b/g-only（排除 11n）→ 下行不走 A-MPDU 聚合，根除
+             * "AP 对 ESP32 聚合下行帧让 RX 解不出"的假在线楔死。仅设一次。 */
+            {
+                static bool proto_set = false;
+                if (!proto_set) {
+                    esp_err_t ep = esp_wifi_set_protocol(WIFI_IF_STA,
+                                        WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G);
+                    Serial.printf("[WiFi] force 11b/g (no 11n/A-MPDU): %d\n", (int)ep);
+                    proto_set = true;
+                }
+            }
             Serial.printf("[WiFi] connected to \"%s\", IP=%s\n",
                           wifi_list[i].ssid, WiFi.localIP().toString().c_str());
             g_wifi_up = true;
+            g_last_ssid_idx = i;             /* 8-19 记住成功 SSID，硬重启快速直连 */
+            g_wifi_ok_ch = WiFi.channel();   /* 8-19 v5: 定频直连需要 */
+            const uint8_t *bs = WiFi.BSSID();
+            if (bs) memcpy(g_wifi_ok_bssid, bs, 6);
 
             /* ★ mDNS：RLCD 用 esp32cam.local 找到本机，IP 变化无感 */
             if (MDNS.begin("esp32cam")) {
@@ -597,26 +702,40 @@ void setup(void)
          * 串口直传与 WiFi 服务资源冲突，WiFi 模式下载口任务不启动。
          * 需要串口直传时再单独烧"串口版"固件（git 历史里有 uart_frame_task）。 */
         // xTaskCreate(uart_frame_task, "uartfrm", 3072, nullptr, 1, nullptr);
-        xTaskCreate(uart_frame_task, "uartfrm", 3072, nullptr, 1, nullptr);   /* USB 全链路视频：串口直传已启用 */
+        /* 方案B（CAM_WIFI_ONLY）：camera↔RLCD 走 WiFi 直连，关闭 USB 串口帧流，
+         * 否则无人读串口会阻塞 WiFi 协议栈（历史坑 memory 595-598）。要回退 USB
+         * 全链路视频则从 platformio.ini 去掉 -DCAM_WIFI_ONLY 重新烧录。 */
+#ifndef CAM_WIFI_ONLY
+        xTaskCreate(uart_frame_task, "uartfrm", 3072, nullptr, 1, nullptr);   /* USB 全链路视频：串口直传 */
         xTaskCreate(uart_cmd_task, "uartcmd", 2048, nullptr, 4, nullptr);    /* 串口命令监听（免按键烧录） */
+#endif
         Serial.println("[CAM] frame grabber (dual-buf) + WDT started (WiFi mode)");
     } else {
         Serial.println("[CAM] WARN: PSRAM alloc failed, /capture will 503");
     }
 
+    WiFi.onEvent(cam_wifi_cb);   /* 8-19 连接状态由事件接管，硬重启非阻塞 */
     connect_wifi();
     start_http_server();
+    /* 8-20 v8 USB 模式：串口帧任务满载(1M)会干扰 WiFi，关掉周期性硬重启任务，
+     * WiFi 仅作状态诊断（/status），视频纯走 USB 串口。 */
+#ifndef CAM_WIFI_ONLY
+    /* USB 模式：WiFi 保留连接 + HTTP 诊断，不做周期性重连 */
+    Serial.println("[CAM] USB mode: WiFi diag only, video via UART");
+#else
+    /* 8-20 v7：预防性重关联独立任务（prio 3，低于 WDT 5，高于抓帧 2） */
+    xTaskCreate(wifi_reassoc_task, "wifiReassoc", 4096, nullptr, 3, nullptr);
+#endif
     g_last_handle_ms = millis();
 }
 
 void loop(void)
 {
-    /* WiFi 掉线自动重连 */
+    /* WiFi 掉线：仅标记，不在此阻塞重连（避免卡 HTTP 服务/帧抓取）。
+     * 重连由独立 wifi_reassoc_task 每 10s 硬重启兜底（v7），loop 只管 HTTP。 */
     if (WiFi.status() != WL_CONNECTED && g_wifi_up) {
-        Serial.println("[WiFi] lost, reconnecting...");
+        Serial.println("[WiFi] link down, waiting for reassoc/heal");
         g_wifi_up = false;
-        connect_wifi();
-        if (g_wifi_up) start_http_server();
     }
     /* 原生 socket：接受并处理新连接（每次一个，响应完即关） */
     WiFiClient client = http_server.available();
