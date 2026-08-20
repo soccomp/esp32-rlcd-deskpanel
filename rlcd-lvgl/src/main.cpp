@@ -4,6 +4,9 @@
 #include <ArduinoOTA.h>     // WiFi OTA：连网后可免线烧录固件
 #include <time.h>
 #include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <lwip/sockets.h>   // wifi_data_alive：非阻塞 connect 探测网关数据面健康
 #include "driver/gpio.h"
 
 #include "display_bsp.h"
@@ -194,6 +197,30 @@ static int      g_wifi_ok_idx = -1;
 static uint8_t  g_wifi_ok_bssid[6] = {0};
 static int32_t  g_wifi_ok_ch = 0;
 
+/* ★ 8-20（Phase 2 P1）统一 WiFi 恢复入口：**首次连接与断线重连走同一函数**。
+ * 旧实现把"刚连上拉数据"逻辑内联在 loop 的 g_wifi_prev 翻转分支里，
+ * 且 30s 重连分支成功后又手动置 g_wifi_prev=true 而跳过恢复——隐藏状态 bug：
+ *   - 断线后 g_wifi_prev 要等 1s tick 才变 false，若 tick 未跑而重连分支已置 true，
+ *     则 connected != g_wifi_prev 恒假，数据恢复/摄像头启动被永久跳过；
+ *   - 预防性 hard restart（未真正掉线）成功后同样不恢复。
+ * 正解：连接就绪（无论首次/重连/硬重启后）统一走本函数刷新数据面。
+ * 幂等：cam_client_init 内部防重；天气/行情由各自定时器节流，重复调用安全。 */
+static void wifi_on_connected(void)
+{
+    /* 刚连上：立即拉取一次行情 + 直连天气 + 启动摄像头客户端 */
+    g_last_stocks = millis();
+    fetch_stocks_data();         /* 行情：连上即拉一次 */
+    g_last_weather = millis();
+    weather_result_t wr = fetch_weather_data();
+    g_weather_ready = (wr == WEATHER_OK);
+    g_weather_permanent = (wr == WEATHER_PERMANENT);
+    if (g_weather_ready) g_weather_fail_cnt = 0;
+    else g_weather_fail_cnt++;
+    cam_client_init();   // 幂等：内部防重复初始化，离线时任务自行退避重试
+    Serial.printf("WiFi connected, IP=%s (services refreshed)\n",
+                  WiFi.localIP().toString().c_str());
+}
+
 static void start_wifi(void)
 {    if (wifi_count == 0) return;
     setenv("TZ", "CST-8", 1);
@@ -248,6 +275,7 @@ static void start_wifi(void)
             Serial.printf("[WiFi] 已连接 \"%s\", IP=%s ch=%d\n",
                           wifi_list[i].ssid, WiFi.localIP().toString().c_str(),
                           (int)g_wifi_ok_ch);
+            wifi_on_connected();   /* 首次连接：统一恢复数据面 */
             break;  // 连上了就不再试下一个
         }
         Serial.printf("[WiFi] \"%s\" 连接失败，尝试下一个\n", wifi_list[i].ssid);
@@ -287,6 +315,7 @@ void wifi_hard_restart(void)
             Serial.printf("[wifi] fast reconnect OK in %ums, IP=%s ch=%d\n",
                           (unsigned)(millis() - t0),
                           WiFi.localIP().toString().c_str(), (int)WiFi.channel());
+            wifi_on_connected();   /* 硬重启后统一恢复数据面（Phase 2 P1） */
             return;
         }
         Serial.println("[wifi] fast reconnect failed, fall back to full scan");
@@ -294,6 +323,53 @@ void wifi_hard_restart(void)
     }
     start_wifi();               /* 慢路径：mode(STA) + 列表轮询 */
     Serial.printf("[wifi] hard restart done in %ums\n", (unsigned)(millis() - t0));
+}
+
+/* ★ 8-20（Phase 2 P1）WiFi 数据面健康探测：轻量 TCP 连网关。
+ * 语义与 cam_client.cpp 的 local_tcp_stack_alive 一致，但独立实现避免跨模块耦合：
+ *   - ECONNREFUSED(111) 也算健康（收到 RST = 包一来一回都通，仅网关没开 80 端口）
+ *   - ETIMEDOUT(116) = SYN 无回应 → 数据面确实死了
+ * 非阻塞 connect + select，超时 800ms（同网段网关 RTT 实测 <50ms，余量 16 倍）。
+ * 只在 WiFi 关联时调用；每次新建短连接立即归还，无资源累积。 */
+static bool wifi_data_alive(void)
+{
+    IPAddress gw = WiFi.gatewayIP();
+    if ((uint32_t)gw == 0) return false;
+
+    int fd = lwip_socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return false;
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family      = AF_INET;
+    sa.sin_port        = htons(80);
+    sa.sin_addr.s_addr = (uint32_t)gw;
+
+    int rc = lwip_connect(fd, (struct sockaddr *)&sa, sizeof(sa));
+    if (rc == 0) { lwip_close(fd); return true; }
+    if (errno != EINPROGRESS) {
+        bool ok = (errno == ECONNREFUSED);
+        lwip_close(fd);
+        return ok;
+    }
+
+    fd_set wr;
+    FD_ZERO(&wr);
+    FD_SET(fd, &wr);
+    struct timeval tv = {0, 800000};   /* 800ms */
+    rc = lwip_select(fd + 1, nullptr, &wr, nullptr, &tv);
+    bool ok;
+    if (rc <= 0) {
+        ok = false;                    /* 超时/错误：SYN 无响应 */
+    } else {
+        int soerr = 0;
+        socklen_t slen = sizeof(soerr);
+        lwip_getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &slen);
+        ok = (soerr == 0 || soerr == ECONNREFUSED);
+    }
+    lwip_close(fd);
+    return ok;
 }
 
 // GPIO4 电池电压 ADC（3 倍分压）：18650 锂电 2.7V=空 ~ 4.2V=满
@@ -398,17 +474,47 @@ void loop()
 {
     ArduinoOTA.handle();   // 必须频繁调用，保证 OTA 能及时响应
 
-    /* ★ 8-19 预防性重关联（AP 对 ESP32 下发 A-MPDU 聚合下行帧，周期性 30~60s
-     * 让 RX 解不出→"假在线"；每次重关联重置 AP 聚合状态即恢复）。在楔死发生前
-     * 主动重连，永远停在健康窗口，使数据面楔死不暴露于用户路径。12s < 楔死周期(~14s)，
-     * 余量充足；wifi_hard_restart 已含快速重连（定频直连，~1s 完成）。 */
+    /* ★ 8-20（Phase 2 P1）健康度驱动 WiFi 自愈（替换原无条件 12s hard restart）。
+     *
+     * 背景/硬件证据（决定保留周期性检查节奏）：AP 对 ESP32 下发 A-MPDU 聚合下行帧，
+     * 周期性 30~60s 让 RX 解不出 → "假在线"（关联在、beacon 收得到，但单播数据面
+     * 双向死亡）。每次重关联重置 AP 聚合状态即恢复；12s < 楔死周期(~14s) 是实测
+     * 有效余量。但**不再无条件每 12s 硬重启**——否则永远停在高频重启，任务书 P1
+     * 明确要求"workaround 不应是最终架构"。
+     *
+     * 新逻辑：每 12s 用轻量 TCP 探测网关判断数据面是否真的健康：
+     *   - HEALTHY（探测通过）→ 什么都不做（不重启，节省重启开销）
+     *   - 连续 FAIL（数据面确死）→ wifi_hard_restart()（重关联重建 PTK/GTK）
+     *   - 连续 hard restart 多次仍失败 → esp_restart()（最终兜底）
+     * 探测只连网关（同网段 <50ms），开销远小于一次 2~4s 的重关联。 */
     {
-        static uint32_t s_prev_reassoc = 0;
-        if (millis() - s_prev_reassoc > 12000UL) {
-            s_prev_reassoc = millis();
+        static uint32_t s_prev_health_check = 0;
+        static uint32_t s_health_fail_cnt   = 0;   /* 连续失败次数 */
+        if (millis() - s_prev_health_check > 12000UL) {
+            s_prev_health_check = millis();
             if (WiFi.status() == WL_CONNECTED) {
-                Serial.println("[wifi] preventive hard restart (ampdu-downlink workaround)");
-                wifi_hard_restart();
+                if (wifi_data_alive()) {
+                    if (s_health_fail_cnt > 0) {
+                        Serial.printf("[wifi] data plane healthy again (after %u fails)\n",
+                                      (unsigned)s_health_fail_cnt);
+                        s_health_fail_cnt = 0;
+                    }
+                } else {
+                    s_health_fail_cnt++;
+                    Serial.printf("[wifi] data plane probe FAIL #%u -> recover\n",
+                                  (unsigned)s_health_fail_cnt);
+                    /* 升级阶梯：确认失败才 hard restart（≥1 次失败即触发，
+                     * 连续 6 次 hard restart 救不回才整机重启） */
+                    if (s_health_fail_cnt >= 6) {
+                        Serial.println("[wifi] recovery x6 ineffective, rebooting");
+                        delay(200);
+                        esp_restart();
+                    } else {
+                        wifi_hard_restart();   /* 重连成功会经 wifi_on_connected 恢复数据 */
+                    }
+                }
+            } else {
+                s_health_fail_cnt = 0;   /* 掉线由 loop 的 30s 重连分支处理 */
             }
         }
     }
@@ -529,17 +635,9 @@ void loop()
         if (connected != g_wifi_prev) {
             g_wifi_prev = connected;
             if (connected) {
-                Serial.printf("WiFi connected, IP=%s\n", WiFi.localIP().toString().c_str());
-                /* 刚连上：立即拉取一次行情 + 直连天气 + 启动摄像头客户端 */
-                g_last_stocks = now;
-                fetch_stocks_data();         /* 行情：连上即拉一次 */
-                g_last_weather = now;
-                weather_result_t wr = fetch_weather_data();
-                g_weather_ready = (wr == WEATHER_OK);
-                g_weather_permanent = (wr == WEATHER_PERMANENT);
-                if (g_weather_ready) g_weather_fail_cnt = 0;
-                else g_weather_fail_cnt++;
-                cam_client_init();   // 幂等：内部防重复初始化，离线时任务自行退避重试
+                /* 首次连接/掉线重连的恢复统一走 wifi_on_connected()，
+                 * 避免与下方 30s 重连分支重复且不一致（Phase 2 P1） */
+                wifi_on_connected();
             } else {
                 Serial.println("WiFi disconnected");
             }
@@ -550,7 +648,9 @@ void loop()
                 g_last_wifi_retry = now;
                 start_wifi();
                 if (WiFi.status() == WL_CONNECTED) {
-                    g_wifi_prev = true;   /* 让下一轮走"刚连上"分支立即拉数据 */
+                    /* 统一恢复已由 start_wifi->wifi_on_connected 完成；
+                     * 仅置位 g_wifi_prev 让 1s tick 状态一致（不重复恢复） */
+                    g_wifi_prev = true;
                     Serial.printf("WiFi reconnected, IP=%s\n",
                                   WiFi.localIP().toString().c_str());
                 }
