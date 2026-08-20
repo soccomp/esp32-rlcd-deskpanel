@@ -80,16 +80,20 @@ static String https_get(const char *host, const String &path,
     return body;
 }
 
-/* 提取以 '~' 分隔的第 idx 个字段（0-based），不存在返回空串 */
-static String field_at(const String &s, int idx)
+/* 提取以 sep 分隔的第 idx 个字段（0-based），不存在返回空串。
+ * ★ 8-20 修复：分隔符参数化——腾讯是 '~'，新浪是 ','。
+ * 旧实现硬编码 '~'，新浪数据上 indexOf('~') 恒返回 -1 → 新浪备用源
+ * 永远解析失败（腾讯失败后直接落到 Mac 后端，违背"腾讯→新浪→后端"
+ * 的降级意图）。两者格式见 fetch_tencent / fetch_sina 注释。 */
+static String field_at(const String &s, int idx, char sep = '~')
 {
     int pos = 0;
     for (int i = 0; i < idx; i++) {
-        pos = s.indexOf('~', pos);
+        pos = s.indexOf(sep, pos);
         if (pos < 0) return "";
         pos++;
     }
-    int end = s.indexOf('~', pos);
+    int end = s.indexOf(sep, pos);
     if (end < 0) end = s.length();
     return s.substring(pos, end);
 }
@@ -161,8 +165,8 @@ static void fetch_sina(void)
 
         String key     = body.substring(pos, eq);      /* "var hq_str_sh000001" */
         String payload = body.substring(q1 + 1, q2);
-        String cur  = field_at(payload, 3);            /* 现价 */
-        String prev = field_at(payload, 2);            /* 昨收 */
+        String cur  = field_at(payload, 3, ',');       /* 现价（, 分隔） */
+        String prev = field_at(payload, 2, ',');       /* 昨收（, 分隔） */
 
         float p = prev.toFloat();
         if (cur.length() > 0 && p != 0.0f) {
