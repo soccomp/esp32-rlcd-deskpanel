@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """RLCD-004：手指数量 -> RLCD 页面切换（M1 侧视觉识别）。
 
-闭环：ESP32-CAM 出图 --串口--> camusb_bridge 本地 hub --> 本程序识别手指数量
-      --命令回注 hub--> bridge 写 RLCD USB-CDC --> RLCD 切页
+闭环（方案 B，WiFi 直连，去掉 USB 串口链路）：
+  ESP32-CAM /capture (HTTP) --> 本程序识别手指数量
+      --命令 TCP--> RLCD:8771 命令服务 --> RLCD 切页
+      <-- ACK:PAGE:X (同一 TCP 连接回传) --
 
 职责分离（任务单要求）：视觉模型只跑在 M1，ESP32 侧只收 "PAGE:xxx" 简单命令。
 
@@ -18,8 +20,9 @@
       同一页面不重复发送。
 
 投递可靠性（RLCD-004.2 改进）：M1 发出 PAGE 命令后**不再**乐观地认为已切页。
-      RLCD 收到命令即经 USB-CDC 回 ``ACK:PAGE:X``，桥接转发给本程序；只有收到对应
-      ACK 才更新权威当前页 confirmed_page，"Already current" 仅基于 confirmed_page。
+      RLCD 收到命令即经 WiFi TCP 命令服务回 ``ACK:PAGE:X``（同一连接），本程序
+      只有收到对应 ACK 才更新权威当前页 confirmed_page，"Already current" 仅基于
+      confirmed_page。
       未在 ack_timeout（默认 1.2s）内收到 ACK 则自动重发，最多 max_attempts（默认 3）
       次，仍无 ACK 记 ``PAGE ACK TIMEOUT``。彻底消除"命令已发送即认为已切页"的状态漂移。
 
@@ -44,14 +47,31 @@ import socket
 import sys
 import threading
 import time
+import http.server
 import urllib.request
 from collections import deque
 
 import cv2
 import numpy as np
 
-HUB_HOST, HUB_PORT = "127.0.0.1", 8770
-HEAD = b"\xaa\x55\x5a\xa5"
+# Plan B WiFi 直连传输参数：
+#   帧来源：ESP32-CAM 的 /capture HTTP 接口（mDNS esp32cam / 回退 192.168.100.199）
+#   命令出口 + 回执：RLCD 的 WiFi TCP 命令服务（默认 192.168.100.197:8771）
+CAM_HOST, CAM_PORT = "esp32cam", 80
+CAM_FALLBACK = "192.168.100.199"
+CAM_PATH = "/capture"
+RLCD_HOST, RLCD_PORT = "192.168.100.197", 8771
+
+# ★ 8-18 必须绕过系统 HTTP 代理，否则内网取帧全部 502 Bad Gateway。
+# 本机环境为 HTTP_PROXY=http://127.0.0.1:7897/（Clash），而
+# NO_PROXY 只有 "localhost,127.0.0.1,::1" —— **不含 192.168.100.0/24**。
+# urllib.request.urlopen() 默认读取系统/环境代理设置，于是对
+# http://192.168.100.199/capture 的请求被交给代理，代理去公网找这个私有地址
+# 自然失败，返回 502 Bad Gateway（现象：finger 持续 "frame error: camera
+# capture failed: HTTP Error 502"，而同一 URL 用 curl 却是 200 —— 因为 Clash
+# 对私有网段有 DIRECT 规则，curl 的请求形式被放行，urllib 的不被放行）。
+# 摄像头与 RLCD 都在局域网内，任何情况下都不应该经过代理，故显式置空 ProxyHandler。
+_DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 PAGE_CMD = {1: "PAGE:HOME", 2: "PAGE:GUITAR", 3: "PAGE:CAMERA"}
 
@@ -138,34 +158,74 @@ def count_fingers(lm):
     return n
 
 
-# ---------------------------------------------------------------- hub 客户端
-class HubClient:
-    """连接 camusb_bridge 的本地 hub：收帧 / 回传命令 / 收 RLCD 回执(ACK)。
+# ---------------------------------------------------------------- WiFi 直连传输（Plan B）
+def _resolve(host, fallback):
+    """mDNS 解析摄像头主机：依次试 host.local 与 host，都不行回退 static IP。"""
+    for cand in (host + ".local", host):
+        try:
+            return socket.gethostbyname(cand)
+        except (socket.gaierror, OSError):
+            continue
+    return fallback
 
-    RLCD-004.2：hub 在同一 TCP 流里既发二进制 JPEG 帧，又发文本行 ``ACK:PAGE:X``。
-    这里用一条后台 recv 线程做解复用——缓冲以帧头(HEAD)开头就当帧，否则按
-    ``\\n`` 切出文本行、挑出 ACK 入 ack_queue——避免阻塞在主循环里漏收 ACK。
+
+class WiFiLink:
+    """Plan B 传输层：HTTP 取摄像头帧 + TCP 给 RLCD 发命令并收 ACK。
+
+    与旧 HubClient 保持相同接口（connect / close / send_cmd / read_frame /
+    ack_queue / sock），主循环逻辑无需改动。帧走 ESP32-CAM 的 /capture HTTP，
+    命令与回执走 RLCD 的 WiFi TCP 命令服务（默认 :8771）。彻底去掉
+    camusb_bridge 本地 hub / USB 串口链路。
+
+    RLCD-004.2：单独 recv 线程拆出 ``ACK:PAGE:X`` 文本行入 ack_queue，不阻塞主循环。
     """
 
-    def __init__(self):
-        self.sock = None
-        self.buf = bytearray()
-        self.frame_q = queue.Queue(maxsize=1)    # 只留最新一帧
-        self.ack_queue = queue.Queue()           # RLCD 回执 ACK:PAGE:X
+    def __init__(self, cam_host=CAM_HOST, cam_fallback=CAM_FALLBACK,
+                 rld_host=RLCD_HOST, rld_port=RLCD_PORT):
+        self.cam_host = cam_host
+        self.cam_fallback = cam_fallback
+        self.rld_host = rld_host
+        self.rld_port = rld_port
+        self.sock = None                 # RLCD TCP（主循环据此判断是否已连接）
+        self.ack_queue = queue.Queue()   # RLCD 回执 ACK:PAGE:X
         self._recv = None
         self._closed = False
+        self._cam_ip = cam_fallback
+        # 帧端口：绑了本地代理 -> 直连摄像头(:80)；否则从本地代理(:8780)取帧
+        self._cam_port = CAM_PORT if g_i_am_proxy else PROXY_PORT
 
-    def connect(self):
-        s = socket.create_connection((HUB_HOST, HUB_PORT), timeout=5)
+    def ensure_cmd_link(self):
+        """建立/复用 RLCD TCP 命令连接（持久；帧取回失败不会断开它）。
+
+        Plan B 关键修正：旧 HubClient 把"帧(USB)"和"命令(TCP)"当作同一条链路，
+        任一失败都整体重连。改为 WiFi 后帧走 HTTP、命令走 TCP 是**两条独立链路**，
+        故这里只负责命令 TCP 的生命周期——帧失败只重试 HTTP GET，绝不碰命令连接。
+        RLCD 的命令服务是单客户端模型，频繁 close/reconnect 会把它冲垮导致
+        ``create_connection`` 超时，所以命令连接必须持久化。"""
+        if self.sock is not None and not self._closed:
+            return
+        # 解析摄像头 IP（mDNS 优先，回退 static）——供 read_frame 取帧用，独立于命令链路
+        if g_i_am_proxy:
+            # 本实例绑定了本地代理 -> 它是摄像头唯一消费者，直连摄像头取帧
+            self._cam_ip = _resolve(self.cam_host, self.cam_fallback)
+            self._cam_port = CAM_PORT
+            log(f"resolved camera -> {self._cam_ip} (mdns {self.cam_host})")
+        else:
+            # 没绑代理端口 -> 从本地代理取帧（摄像头唯一消费者是对端绑定者），避免双消费者
+            self._cam_ip = "127.0.0.1"
+            self._cam_port = PROXY_PORT
+            log(f"frame source -> local proxy 127.0.0.1:{PROXY_PORT}")
+        # 连接 RLCD TCP 命令服务
+        s = socket.create_connection((self.rld_host, self.rld_port), timeout=5)
         s.settimeout(1.0)
         self.sock = s
-        self.buf.clear()
         self._closed = False
         self._recv = threading.Thread(target=self._recv_loop, daemon=True)
         self._recv.start()
-        log(f"connected to hub {HUB_HOST}:{HUB_PORT}")
+        log(f"connected to RLCD cmd server {self.rld_host}:{self.rld_port}")
 
-    def close(self):
+    def close_cmd_link(self):
+        """仅关闭命令 TCP 连接（由调用方在 send 失败/recv 线程退出后触发重连）。"""
         self._closed = True
         try:
             if self.sock:
@@ -174,70 +234,128 @@ class HubClient:
             pass
         self.sock = None
 
+    def cmd_ready(self):
+        """命令 TCP 当前是否可用（用于发送前判断，避免对死连接盲目 send）。"""
+        return self.sock is not None and not self._closed
+
     def send_cmd(self, cmd):
         self.sock.sendall(cmd.encode("ascii") + b"\n")
 
     def _recv_loop(self):
+        # 该 TCP 只传文本 ACK 行，按 \\n 拆出 ACK:PAGE:X；socket.timeout 是 OSError
+        # 子类，必须单独捕获，否则误杀 recv 线程。
         while not self._closed:
             try:
-                chunk = self.sock.recv(65536)
+                chunk = self.sock.recv(4096)
             except socket.timeout:
-                continue                    # 无数据：继续等，绝不退出（曾误杀 recv 线程）
+                continue                    # 无数据：继续等，绝不退出
             except OSError:
                 self._closed = True
                 return
             if not chunk:
                 self._closed = True
                 return
-            self.buf.extend(chunk)
-            self._demux()
+            for line in chunk.decode("ascii", "ignore").splitlines():
+                line = line.strip()
+                if line.startswith("ACK:"):
+                    self.ack_queue.put(line)
 
-    def _demux(self):
-        while True:
-            if self.buf.startswith(HEAD) and len(self.buf) >= 8:
-                flen = (self.buf[4] << 8) | self.buf[5]
-                if 0 < flen <= 100000 and len(self.buf) >= 8 + flen:
-                    frame = bytes(self.buf[6:6 + flen])
-                    crc_r = (self.buf[6 + flen] << 8) | self.buf[7 + flen]
-                    crc_c = flen & 0xFFFF
-                    for b in frame:
-                        crc_c = (crc_c + b) & 0xFFFF
-                    del self.buf[:8 + flen]
-                    if crc_c == crc_r:
-                        try:
-                            self.frame_q.put_nowait(frame)
-                        except queue.Full:
-                            try:
-                                self.frame_q.get_nowait()   # 丢旧帧
-                            except queue.Empty:
-                                pass
-                            try:
-                                self.frame_q.put_nowait(frame)
-                            except queue.Full:
-                                pass
-                    continue
-                if flen <= 0 or flen > 100000:
-                    del self.buf[:2]
-                    continue
-                break   # 帧未收全，等更多数据
-            nl = self.buf.find(b"\n")
-            if nl >= 0:
-                line = bytes(self.buf[:nl])
-                del self.buf[:nl + 1]
-                s = line.strip().decode("ascii", "ignore")
-                if s.startswith("ACK:"):
-                    self.ack_queue.put(s)
-                continue
-            break
+    def read_frame(self, timeout=8):
+        """HTTP GET 摄像头 /capture 取一帧 JPEG；失败抛 ConnectionError。
 
-    def read_frame(self, timeout=5):
-        """阻塞取一帧 JPEG（来自帧队列，已校验 CRC）；超时/断链抛 ConnectionError。"""
+        与命令 TCP 完全独立：本函数只做 HTTP 取帧，无论成败都不触动 RLCD 命令连接。
+        """
+        url = f"http://{self._cam_ip}:{self._cam_port}{CAM_PATH}"
         try:
-            return self.frame_q.get(timeout=timeout)
-        except queue.Empty:
-            if self._closed:
-                raise ConnectionError("hub closed")
-            raise ConnectionError("frame timeout (hub stalled?)")
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "finger_page_control/1.1"})
+            # 用 _DIRECT_OPENER 而非 urlopen：内网地址必须绕过系统代理（详见顶部注释）
+            with _DIRECT_OPENER.open(req, timeout=timeout) as r:
+                data = r.read()
+        except (urllib.error.URLError, OSError, socket.timeout) as e:
+            raise ConnectionError(f"camera capture failed: {e}")
+        if len(data) < 64 or not data.startswith(b"\xff\xd8"):
+            raise ConnectionError("camera returned non-JPEG payload")
+        return data
+
+
+# ---------------------------------------------------------------- 本地帧代理（Plan B+）
+# ESP32-CAM 的 HTTP server 是单线程、一次只服务一个连接（/capture 单次 ~1s），
+# 若 RLCD 与 M1 同时拉 /capture 会被挤爆（实测双消费者 60% 超时）。
+# 故：M1 作为摄像头**唯一**外部消费者拉帧，并把最新帧缓存在本地 :8780 HTTP
+# 代理；RLCD 改为从 M1 代理取帧。摄像头只剩 1 个消费者 -> 稳定；RLCD 走
+# localhost 代理取帧也稳定。M1 宕机时 RLCD 回退直连摄像头（无手势，独占不挤）。
+PROXY_PORT = 8780
+g_latest_jpeg = [b""]          # 最新一帧 JPEG（列表容器，避免 global 声明）
+g_jpeg_lock = threading.Lock()
+g_i_am_proxy = False           # 本实例是否成功绑定 :8780 代理（唯一摄像头消费者）
+
+
+class _QuietThreadingHTTPServer(http.server.ThreadingHTTPServer):
+    """静默版 ThreadingHTTPServer。
+
+    RLCD 端为根治 TIME_WAIT 耗尽 lwIP PCB 池，取帧连接改用 SO_LINGER=0 关闭
+    （发 RST 而非 FIN）。服务端因此每帧都会收到 ConnectionResetError ——
+    这是预期行为而非故障，若不静默，socketserver 会为每一帧打印一整段
+    traceback，把日志彻底刷爆。handle_error 定义在 socketserver.BaseServer 上，
+    必须覆盖 server 而不是 handler。"""
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def handle_error(self, request, client_address):
+        pass
+
+
+class _FrameHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path.startswith("/capture"):
+            with g_jpeg_lock:
+                data = g_latest_jpeg[0]
+            if not data:
+                self.send_response(503)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        else:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+    def log_message(self, *a):
+        pass   # 静默，避免刷日志
+
+
+def start_frame_proxy(host="0.0.0.0", port=PROXY_PORT, retries=8, delay=0.5):
+    """启动本地帧代理。若端口被占用（多为被上一次 -9 杀掉的实例留下 TIME_WAIT
+    或被另一个本机实例占用），带重试绑定，避免频繁 kill/重启导致永久绑不上。
+    返回 server 表示本实例是摄像头唯一消费者；返回 None 表示端口已被别的实例
+    占用，本实例改为从 127.0.0.1:port 取帧（不直连摄像头，杜绝双消费者挤爆）。"""
+    global g_i_am_proxy
+    last = None
+    for attempt in range(1, retries + 1):
+        try:
+            srv = _QuietThreadingHTTPServer((host, port), _FrameHandler)
+            t = threading.Thread(target=srv.serve_forever, daemon=True)
+            t.start()
+            g_i_am_proxy = True
+            log(f"frame proxy started: http://{host}:{port}/capture (feeds latest frame to RLCD)")
+            return srv
+        except OSError as e:
+            last = e
+            log(f"frame proxy bind {host}:{port} failed (attempt {attempt}/{retries}): {e}; retry in {delay}s")
+            time.sleep(delay)
+    # 多次重试仍失败：端口确实被占用 -> 本实例不当摄像头消费者
+    g_i_am_proxy = False
+    log(f"frame proxy NOT started (port {port} busy) -> this instance will pull frames "
+        f"from http://127.0.0.1:{port}/capture (camera sole consumer is the binder)")
+    return None
 
 
 # ---------------------------------------------------------------- 主流程
@@ -343,12 +461,20 @@ def main():
     ap.add_argument("--save-dir", default=None, help="另存带标注的调试图到该目录")
     ap.add_argument("--save-every", type=int, default=1, help="每 N 帧存一张")
     ap.add_argument("--max-frames", type=int, default=0, help=">0 时处理够帧数即退出")
+    ap.add_argument("--cam-host", default=CAM_HOST,
+                    help="摄像头 mDNS 主机名（默认 esp32cam，解析失败回退 192.168.100.199）")
+    ap.add_argument("--rlcd-host", default=RLCD_HOST,
+                    help="RLCD WiFi 命令服务主机（默认 192.168.100.197）")
+    ap.add_argument("--rlcd-port", type=int, default=RLCD_PORT,
+                    help="RLCD WiFi 命令服务端口（默认 8771）")
     args = ap.parse_args()
 
     if args.save_dir:
         os.makedirs(args.save_dir, exist_ok=True)
 
     det = HandDetector()
+    # Plan B+：本地帧代理，供 RLCD 取帧（M1 是摄像头唯一外部消费者）
+    start_frame_proxy()
     # ---- 触发参数（RLCD-004.1：滚动窗口多数表决 + 冷却）----
     min_agree = args.min_agree if args.consec is None else args.consec
     if min_agree < 1:
@@ -356,7 +482,7 @@ def main():
     win_sec = args.win_sec
     cooldown = args.cooldown
 
-    hub = HubClient()
+    hub = WiFiLink(args.cam_host, CAM_FALLBACK, args.rlcd_host, args.rlcd_port)
     trig = FingerTrigger(min_agree, win_sec, cooldown)
 
     # ---- RLCD-004.2：命令投递可靠性状态 ----
@@ -375,20 +501,27 @@ def main():
         f"max_attempts={MAX_ATTEMPTS}, dry_run={args.dry_run}")
 
     while True:
+        # 1) 取帧（独立于 RLCD 命令链路：即便 RLCD 暂不可达也照常识别手势）
         try:
-            if hub.sock is None:
-                hub.connect()
             jpg = hub.read_frame()
         except (OSError, ConnectionError) as e:
-            log(f"hub link lost: {e} -- retry in 3s")
-            hub.close()
-            time.sleep(3)
+            log(f"frame error: {e} -- retry in 2s")
+            time.sleep(2)
             continue
 
         bgr = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
         if bgr is None:
             continue
         frames += 1
+        with g_jpeg_lock:
+            g_latest_jpeg[0] = jpg     # 缓存给本地帧代理（喂 RLCD）
+
+        # 2) 确保 RLCD 命令链路（失败仅影响发命令，不阻断识别/代理）
+        try:
+            hub.ensure_cmd_link()
+        except OSError as e:
+            log(f"RLCD cmd link down: {e} (gesture still detected, commands paused)")
+
         now = time.time()
 
         lm = det.detect(bgr)
@@ -431,15 +564,18 @@ def main():
                     log(f"CANCEL pending {pending['cmd']} -> new {cmd}")
                     pending = None
                 if not args.dry_run:
-                    try:
-                        hub.send_cmd(cmd)
-                        pending = {"cmd": cmd, "sent_t": now, "attempts": 1}
-                        log(f"SEND: {cmd} (attempt 1) | HAND:{hand} "
-                            f"FINGER:{fingers if lm else '-'} "
-                            f"WIN:{counts} MAJ:{maj_v}({maj_n}/{wlen})")
-                    except OSError as e:
-                        log(f"send failed: {e}")
-                        hub.close()
+                    if hub.cmd_ready():
+                        try:
+                            hub.send_cmd(cmd)
+                            pending = {"cmd": cmd, "sent_t": now, "attempts": 1}
+                            log(f"SEND: {cmd} (attempt 1) | HAND:{hand} "
+                                f"FINGER:{fingers if lm else '-'} "
+                                f"WIN:{counts} MAJ:{maj_v}({maj_n}/{wlen})")
+                        except OSError as e:
+                            log(f"send failed: {e}")
+                            hub.close_cmd_link()
+                    else:
+                        log(f"DEFER: {cmd} (RLCD cmd link down)")
                 else:
                     log(f"TRIGGER(dry-run): {cmd} | HAND:{hand} "
                         f"FINGER:{fingers if lm else '-'} "
@@ -460,14 +596,16 @@ def main():
             age = now - pending["sent_t"]
             if age >= ACK_TIMEOUT and pending["attempts"] < MAX_ATTEMPTS:
                 if not args.dry_run:
-                    try:
-                        hub.send_cmd(pending["cmd"])
-                        pending["sent_t"] = now
-                        pending["attempts"] += 1
-                        log(f"RESEND: {pending['cmd']} (attempt {pending['attempts']})")
-                    except OSError as e:
-                        log(f"resend failed: {e}")
-                        hub.close()
+                    if hub.cmd_ready():
+                        try:
+                            hub.send_cmd(pending["cmd"])
+                            pending["sent_t"] = now
+                            pending["attempts"] += 1
+                            log(f"RESEND: {pending['cmd']} (attempt {pending['attempts']})")
+                        except OSError as e:
+                            log(f"resend failed: {e}")
+                            hub.close_cmd_link()
+                    # 链路不通则暂不重发，保留 pending 等链路恢复
                 else:
                     pending["sent_t"] = now
                     pending["attempts"] += 1
@@ -492,7 +630,7 @@ def main():
 
     dt = time.time() - t0
     log(f"processed {frames} frames in {dt:.1f}s ({frames / dt if dt else 0:.2f}fps)")
-    hub.close()
+    hub.close_cmd_link()
     if args.show:
         cv2.destroyAllWindows()
 
