@@ -1,0 +1,17 @@
+# RLCD M1 运行时依赖（schedule-api / camusb-bridge / finger_page_control）
+# 生成自当前运行 venv（Python 3.13.12），版本为实测锁定值。
+#
+# 安装方式（本机默认 venv）：
+#   /Users/m1work/.workbuddy/binaries/python/envs/default/bin/pip install -r requirements.txt
+
+# --- schedule-api (rlcd-lvgl/parse_schedule.py) ---
+fastapi==0.141.1
+uvicorn==0.40.0
+
+# --- camusb_bridge.py (esp32-cam-fw/) ---
+pyserial>=3.5
+
+# --- finger_page_control.py 手势识别 (esp32-cam-fw/) ---
+mediapipe==1.0.0
+opencv-contrib-python==5.0.0.93
+numpy>=1.26
