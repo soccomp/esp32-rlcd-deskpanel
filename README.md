@@ -1,6 +1,6 @@
 # ESP32-RLCD DeskPanel
 
-一个**桌面信息面板**：Waveshare ESP32-S3-RLCD-4.2 反射屏（400×300 单色、无背光）显示时间/天气/会议/股票行情，并实时预览 ESP32-CAM 摄像头画面。
+一个**桌面信息面板**：Waveshare ESP32-S3-RLCD-4.2 反射屏（400×300 单色、无背光）显示时间/天气/股票行情/法语学习卡，并实时预览 ESP32-CAM 摄像头画面（USB 全链路）。
 
 > 📖 **给代码审查者（AI）**：想快速理解全貌，请按顺序读
 > `README.md`（本文件）→ **`docs/ARCHITECTURE.md`**（硬件/通讯/软件设计/功能详解）→ **`PROBLEM.md`**（摄像头→RLCD 显示问题与审查指引）→
@@ -9,25 +9,25 @@
 ## 系统概览
 
 ```
-┌─────────────────────────────┐         ┌──────────────────────────────┐
-│  rlcd-lvgl/  ESP32-S3 固件   │  WiFi   │  Mac 后端 (parse_schedule.py) │
-│  · LVGL v8 三页信息面板      │◄───────►│  · FastAPI/uvicorn :8100      │
-│  · 时间/天气/会议/行情        │  mDNS   │  · 会议/天气/行情/摄像头帧代理  │
-│  · 摄像头缩略预览 (1bit)      │         │  · launchd 常驻               │
-└─────────────────────────────┘         └──────────────┬───────────────┘
-                                                        │ WiFi (Mac 不受 AP RST 限制)
-                                                        ▼
-                                        ┌──────────────────────────────┐
-                                        │  esp32-cam-fw/ ESP32-CAM 固件  │
-                                        │  · /capture 单帧 /status 诊断  │
-                                        │  · cam_grab_task 常驻抓帧      │
-                                        └──────────────────────────────┘
+┌─────────────────────────────┐   USB-CDC    ┌──────────────────────────────┐
+│  rlcd-lvgl/  ESP32-S3 固件   │◄───────────►│  M1 Mac                     │
+│  · LVGL v8 三页信息面板      │  串口帧+命令 │  · camusb_bridge (hub 8770)  │
+│  · 时间/天气/行情/法语卡      │              │  · finger_page_control.py    │
+│  · 摄像头预览 (USB 全链路)    │              │  · parse_schedule.py :8100   │
+└────────────┬────────────────┘              └──────────────┬───────────────┘
+             │ HTTPS 直连                                    │ USB-TTL 1M (帧协议)
+             ▼                                              ▼
+   ┌─────────────────────┐                       ┌──────────────────────┐
+   │ 腾讯 qt.gtimg.cn     │                       │ esp32-cam-fw/         │
+   │ 东财 push2.eastmoney │                       │ ESP32-CAM (OV3660)    │
+   │ QWeather (天气)      │                       │ uart_frame_task 串口帧 │
+   └─────────────────────┘                       └──────────────────────┘
 ```
 
 **三段角色**：
-- **RLCD（ESP32-S3）**：显示终端 + 数据消费者（会议/天气/行情/摄像头画面）。
-- **Mac 后端**：数据聚合 + **摄像头帧代理**（摄像头直连受企业 AP RST 限制，经 Mac 中转）。
-- **ESP32-CAM**：图像采集端（OV3660 sensor，DVP 并口，JPEG 输出）。
+- **RLCD（ESP32-S3）**：显示终端 + 数据消费者（时间/天气/行情/法语卡/摄像头画面）。
+- **M1 Mac**：摄像头 USB 桥接（`camusb_bridge.py`）+ 手势切页（`finger_page_control.py`）+ 天气软回退后端。
+- **ESP32-CAM**：图像采集端（OV3660 sensor，DVP 并口，JPEG 输出，USB-TTL 串口上送）。
 
 ## 硬件组成
 
@@ -43,29 +43,29 @@
 ## 通讯链路
 
 1. **板内**：SPI→屏幕；I²C→RTC/温湿度/Codec；I²S→音频（16kHz，MCLK=4.096MHz）。
-2. **RLCD ↔ Mac**：HTTP/JSON（mDNS 解析 Mac 主机名，失败回退 IP）；拉取 schedule/stocks/weather/camframe。
-3. **Mac ↔ 摄像头**：HTTP/JPEG，后台线程每 500ms 抓 `/capture` 缓存最新帧（长连接，匹配单客户端模型）。
-4. **RLCD → 外网**：天气直连 Open-Meteo 或经 Mac 代理；行情经 Mac（腾讯/东财源）。
+2. **RLCD → 外网**：HTTPS 直连——行情走腾讯 `qt.gtimg.cn` + 东财 `push2.eastmoney.com`（**固件直连，不走 Mac**）；天气 QWeather 直连为主，失败回退 Mac `/api/weather_qh`。
+3. **ESP32-CAM → M1**：USB-TTL 串口 1M，帧协议 `AA55 5AA5|len(2B BE)|JPEG|crc16(2B BE)`，640×480 ~2fps；`camusb_bridge.py` 常驻桥接。
+4. **M1 → RLCD**：USB-CDC，bridge 回写 hub 消息（JPEG 帧 + `PAGE:X`/`ACK:PAGE:X` 命令）。
 
-> ⚠️ 摄像头帧**必须**走 Mac 代理：办公室 AP（BTWIFI6 系列）对 ESP32 出站 TCP 做 per-device RST，直连不稳定（errno 113）。详见 `PROBLEM.md`。
+> ⚠️ 摄像头帧走 **USB 全链路**（2026-08-20 定案）：办公室 AP（BTWIFI6 系列）对 ESP32 出站 TCP 做 per-device RST，WiFi 直连 6 版固件均未根治周期楔死；USB-TTL + bridge 绕开 WiFi 数据面。详见 `PROBLEM.md`。
 
 ## 软件设计（摘要，详见 docs/ARCHITECTURE.md）
 
-- **RLCD 固件**（Arduino + LVGL v8）：三页 `lv_tileview`；多任务（LVGL / 主循环 / cam_client / 音频）；网络侧写缓存 + LVGL 侧渲染（`Lvgl_lock`）；SD 离线缓存；中文字体 C 数组。
-- **Mac 后端**：FastAPI 接口（schedule/stocks/weather_qh/camframe/camframe_stream）；行情 60s 缓存 + 磁盘持久化；帧代理后台线程；launchd 常驻。
-- **摄像头固件**：`cam_grab_task` 常驻抓帧 → `/capture` 秒回；`/status` 的 `seq` 为帧通道判据；看门狗软重启；mDNS + 静态 IP。
+- **RLCD 固件**（Arduino + LVGL v8）：三页 `lv_tileview`（首页/环境吉他页/摄像头页）；多任务（LVGL / 主循环 / rx_task / cam_task / 音频）；网络侧写缓存 + LVGL 侧渲染（`Lvgl_lock`）；SD 离线缓存；中文字体 C 数组；LVGL 走 registry `lvgl@8.4.0` + `scripts/patch_lvgl.py` 补丁钩子（可复现）。
+- **M1 Mac**：`camusb_bridge.py`（USB 桥接，hub :8770，launchd 常驻）+ `finger_page_control.py`（MediaPipe 手势→页面命令，ACK 闭环）+ `parse_schedule.py`（FastAPI :8100，天气软回退）。
+- **摄像头固件**：`cam_grab_task` 常驻抓帧 → `uart_frame_task` 串口 1M 上送；`/status` 的 `seq` 为帧通道判据；看门狗软重启。
 
 ## 功能清单
 
-数字时钟/日期（RTC+NTP）· 天气（室内 SHTC3 + 室外 QWeather/Open-Meteo）· 会议日程（3 卡/屏，筛选我的会议）· 股票行情（4 指数，交易时段 10min 刷新）· 摄像头缩略预览（200×150 1-bit）· 吉他拨弦（和弦+音效+功德计数）· 法语短句轮换。
+数字时钟/日期/农历（RTC+NTP）· 天气（室内 SHTC3 + 室外 QWeather 直连）· 股票行情（4 指数，固件直连腾讯/东财）· 法语学习卡（200 组中法对话，5 分钟轮换）· 摄像头预览（USB 全链路 200×150 1-bit + 全屏页）· 吉他拨弦（和弦+音效+功德计数）· 状态栏 CAM 指示（●/○）· 手势切页（1/2/3 指）。
 
 ## 目录结构
 
 | 路径 | 内容 |
 |---|---|
 | `rlcd-lvgl/` | RLCD 固件 + Mac 后端 `parse_schedule.py` + 字体/图标生成脚本（`gen_*.py`） |
-| `esp32-cam-fw/` | ESP32-CAM 固件 + 串口直连工具（`uart_cam_*.py`，1M 波特率帧协议） |
-| `docs/` | **`ARCHITECTURE.md`**（架构详解）、`BOARD_REFERENCE.md`、`LEARNING_NOTES.md`、`datasheets/`（官方 PDF） |
+| `esp32-cam-fw/` | ESP32-CAM 固件 + USB 桥接/串口工具（`camusb_bridge.py`、`uart_cam_*.py`，1M 波特率帧协议） |
+| `docs/` | **`ARCHITECTURE.md`**（架构详解）、`BOARD_REFERENCE.md`、`LEARNING_NOTES.md`、`execution_reports/`、`datasheets/`（官方 PDF） |
 | `PROBLEM.md` | 摄像头→RLCD 显示问题：症状 / 已排查结论 / 请审查点 |
 
 ## 构建与烧录
