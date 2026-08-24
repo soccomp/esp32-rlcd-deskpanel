@@ -233,11 +233,11 @@ static bool fetch_backend_stocks(void)
     return g_quote_n > 0;
 }
 
-void fetch_stocks_data(void)
+bool fetch_stocks_data(void)
 {
     if (WiFi.status() != WL_CONNECTED) {
         Serial.println("Stocks fetch skipped: WiFi not connected");
-        return;
+        return false;
     }
 
     g_quote_n = 0;
@@ -258,7 +258,7 @@ void fetch_stocks_data(void)
         } else {
             Serial.println("[stocks] 后端代理也失败，恢复 SD 缓存");
             load_cached_stocks();
-            return;
+            return false;   /* P2: 仅旧缓存，非本槽位新数据 → 调用方不推进槽位 */
         }
     }
 
@@ -298,6 +298,7 @@ void fetch_stocks_data(void)
         Serial.println("[stocks] Lvgl_lock 超时，行情 UI 未刷新");
     }
     Serial.printf("[stocks] OK: %d quotes\n", g_quote_n);
+    return true;   /* P2: 拿到本槽位新行情 */
 }
 
 /* 从 SD 缓存恢复行情（直连失败时调用；无缓存则保持现状） */

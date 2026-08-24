@@ -8,8 +8,10 @@
  * ============================================================ */
 
 /* 股票指数行情：直连腾讯(qt.gtimg.cn)+东财(push2.eastmoney.com)，解析后刷新主页右上卡
- * 交易时段（工作日 09:30-11:30 / 13:00-15:30）每 10 分钟由 main.cpp 调用 */
-void fetch_stocks_data(void);
+ * 交易时段（工作日 09:30-11:30 / 13:00-15:30）每 10 分钟由 main.cpp 调用。
+ * Phase 2 P2：返回是否拿到**新**行情（true=任一源成功；
+ * false=仅恢复 SD 旧缓存/完全失败——调用方不得推进交易所时钟槽位，下轮重试）。 */
+bool fetch_stocks_data(void);
 
 /* 从 SD 离线缓存恢复行情（fetch 失败/后端不可达时调用） */
 void load_cached_stocks(void);

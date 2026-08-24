@@ -71,7 +71,8 @@ static bool g_wifi_prev = false;
 static bool g_ntp_done = false;
 static bool g_bat_printed = false;   // 一次性打印电池电压用于验证
 static uint32_t g_last_weather = 0;   // 上次直连尝试拉取天气的时刻
-static uint32_t g_last_stocks = 0;    // 上次拉取股票行情的时刻（交易时段 10 分钟一次）
+static uint32_t g_last_stocks = 0;    // 上次拉取股票行情的时刻（兼容旧引用；见下方槽位逻辑）
+static int g_last_stocks_slot = -1;   // Phase 2 P2：上次成功刷新的交易所时钟槽位（分钟数，-1=未就绪）
 static uint32_t g_last_wifi_retry = 0;  // 上次 WiFi 重连尝试的时刻（掉线后 30s 重试）
 static bool g_weather_ready = false;  // 最近一次拉取是否成功（失败时 5 分钟重试）
 static uint8_t g_weather_fail_cnt = 0; // 连续失败次数（指数退避：2^n 分钟，上限 1 小时）
@@ -209,6 +210,7 @@ static void wifi_on_connected(void)
 {
     /* 刚连上：立即拉取一次行情 + 直连天气 + 启动摄像头客户端 */
     g_last_stocks = millis();
+    g_last_stocks_slot = -1;       /* P2: 重连后重新从当前槽位开始 */
     fetch_stocks_data();         /* 行情：连上即拉一次 */
     g_last_weather = millis();
     weather_result_t wr = fetch_weather_data();
@@ -698,24 +700,37 @@ void loop()
                     else g_weather_fail_cnt++;
                 }
             }
-            /* 股票行情：交易时段（工作日 09:30-11:30 / 13:00-15:00）每 10 分钟刷新；
-             * 非交易时段不刷新，保留最后一次数据。 */
-            if (now - g_last_stocks >= 10 * 60 * 1000UL) {
-                g_last_stocks = now;
-                time_t st = time(nullptr);
-                if (st > 1700000000UL) {
-                    struct tm *sti = localtime(&st);
-                    bool weekday = (sti->tm_wday >= 1 && sti->tm_wday <= 5);
-                    int h = sti->tm_hour, m = sti->tm_min;
-                    int t = h * 60 + m;
-                    /* 交易时段：上午 9:30-11:30、下午 13:00-15:30。
-                     * 下午延长到 15:30：行情接口在 15:00 收盘后仍会短暂更新
-                     * （约 15:15 才定格为最终收盘价），延长刷新窗口确保拿到收盘价，
-                     * 避免屏幕卡在收盘前的中间值。 */
-                    bool trading = weekday &&
-                                   ((t >= 9 * 60 + 30 && t <= 11 * 60 + 30) ||
-                                    (t >= 13 * 60 && t <= 15 * 60 + 30));
-                    if (trading) fetch_stocks_data();
+            /* 股票行情 —— Phase 2 P2 交易所时钟槽位（替代相对定时器，消除漂移）。
+             * 相对定时器缺陷：刷新时刻锚定"上次完成时刻"，若上次拉取耗时/失败，
+             * 后续会逐次漂移（例：11:29 更新 → 下次 13:09 而非 13:00）。
+             * 槽位方案：把交易时段切成 10 分钟网格（9:30,9:40,...11:30,13:00,...15:30），
+             * 当前分钟向下取整得到当前槽位；槽位变化才刷新，刷新成功才推进槽位，
+             * 失败保持原槽位下轮重试 → 时刻始终锚定交易所时钟，不累积漂移。
+             * 非交易时段槽位重置为 -1，开盘后首个槽位（如 9:30）必刷。 */
+            time_t st = time(nullptr);
+            if (st > 1700000000UL) {
+                struct tm *sti = localtime(&st);
+                bool weekday = (sti->tm_wday >= 1 && sti->tm_wday <= 5);
+                int h = sti->tm_hour, m = sti->tm_min;
+                int t = h * 60 + m;
+                /* 交易时段：上午 9:30-11:30、下午 13:00-15:30。
+                 * 下午延长到 15:30：行情接口在 15:00 收盘后仍会短暂更新
+                 * （约 15:15 才定格为最终收盘价），延长刷新窗口确保拿到收盘价，
+                 * 避免屏幕卡在收盘前的中间值。 */
+                bool trading = weekday &&
+                               ((t >= 9 * 60 + 30 && t <= 11 * 60 + 30) ||
+                                (t >= 13 * 60 && t <= 15 * 60 + 30));
+                if (trading) {
+                    int slot = (t / 10) * 10;   /* 当前交易所时钟槽位（分钟网格） */
+                    if (slot != g_last_stocks_slot) {
+                        if (fetch_stocks_data()) {
+                            g_last_stocks_slot = slot;   /* 仅成功才推进槽位 */
+                        }
+                        g_last_stocks = millis();
+                    }
+                } else {
+                    /* 非交易时段：重置槽位，下一交易段首槽必刷 */
+                    g_last_stocks_slot = -1;
                 }
             }
         }

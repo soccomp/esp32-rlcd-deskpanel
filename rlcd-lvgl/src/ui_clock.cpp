@@ -59,6 +59,7 @@ static lv_obj_t *g_stk_val_lb[STOCK_ROWS] = {0};  // 每行：点位（右对齐
 static lv_obj_t *g_stk_pct_lb[STOCK_ROWS] = {0};  // 每行：百分比（右对齐，竖列对齐）
 static lv_obj_t *g_stk_loading = nullptr;         // “行情获取中...” 占位
 static lv_obj_t *g_stk_time = nullptr;            // 右下角刷新时间（MM-DD HH:MM，montserrat_12）
+static lv_obj_t *g_stk_state = nullptr;           // Phase 2 P2：缓存新鲜度状态（LIVE/CACHED/STALE）
 
 /* 行情数据缓存：set 侧（网络任务）只写缓存，update 侧（LVGL 任务）渲染 */
 static volatile bool g_stk_valid = false;
@@ -111,6 +112,7 @@ static const lv_coord_t FLIP_CARD_H = 64;   /* 缩小反色黑卡，让时钟居
 static void clock_tick_cb(lv_timer_t *t);
 static void env_tick_cb(lv_timer_t *t);
 static void fr_learn_cb(lv_timer_t *t);       /* 法语学习卡 5 分钟换一组 */
+static void update_stocks_status(void);       /* Phase 2 P2 缓存新鲜度（LIVE/CACHED/STALE） */
 
 /* 法语学习卡：一组对话同屏双语（8-14 替代两条随机短句） */
 static void build_fr_learn_card(lv_obj_t *parent, lv_coord_t x, lv_coord_t y,
@@ -424,12 +426,24 @@ void ui_clock_init(lv_obj_t *parent, lv_obj_t *status_bar)
     g_stk_time = lv_label_create(g_stk_card);
     lv_obj_set_style_text_font(g_stk_time, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(g_stk_time, lv_color_black(), 0);
-    lv_obj_set_width(g_stk_time, 150);
+    lv_obj_set_width(g_stk_time, 116);
     lv_obj_set_style_text_align(g_stk_time, LV_TEXT_ALIGN_RIGHT, 0);
     lv_label_set_long_mode(g_stk_time, LV_LABEL_LONG_CLIP);
     lv_label_set_text(g_stk_time, "");
-    lv_obj_set_pos(g_stk_time, 6, 96);
+    lv_obj_set_pos(g_stk_time, 48, 96);
     lv_obj_add_flag(g_stk_time, LV_OBJ_FLAG_HIDDEN);
+
+    /* Phase 2 P2：缓存新鲜度状态（LIVE/CACHED/STALE）——时间戳左侧左对齐。
+     * 每秒由 clock_tick_cb -> update_stocks_status() 实时计算刷新。 */
+    g_stk_state = lv_label_create(g_stk_card);
+    lv_obj_set_style_text_font(g_stk_state, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(g_stk_state, lv_color_black(), 0);
+    lv_obj_set_width(g_stk_state, 42);
+    lv_obj_set_style_text_align(g_stk_state, LV_TEXT_ALIGN_LEFT, 0);
+    lv_label_set_long_mode(g_stk_state, LV_LABEL_LONG_CLIP);
+    lv_label_set_text(g_stk_state, "");
+    lv_obj_set_pos(g_stk_state, 8, 96);
+    lv_obj_add_flag(g_stk_state, LV_OBJ_FLAG_HIDDEN);
 
     g_stk_loading = lv_label_create(g_stk_card);
     lv_obj_set_style_text_font(g_stk_loading, &lv_font_chinese_14, 0);
@@ -650,6 +664,7 @@ void ui_clock_update_stocks(void)
     if (!g_stk_valid) {
         lv_obj_clear_flag(g_stk_loading, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(g_stk_time, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(g_stk_state, LV_OBJ_FLAG_HIDDEN);
         for (int i = 0; i < STOCK_ROWS; ++i)
             lv_obj_add_flag(g_stk_bg[i], LV_OBJ_FLAG_HIDDEN);
         return;
@@ -684,18 +699,45 @@ void ui_clock_update_stocks(void)
         lv_obj_clear_flag(g_stk_bg[i], LV_OBJ_FLAG_HIDDEN);
     }
 
-    /* 右下角刷新时间：MM-DD HH:MM（与天气卡获取时间同格式）。仅当 NTP 已同步（年份 >= 2025）才显示 */
-    if (g_stk_last_ts) {
-        time_t ts = (time_t)g_stk_last_ts;
-        struct tm tmv;
-        localtime_r(&ts, &tmv);
-        if (tmv.tm_year >= 125) {
-            char tbuf[16];
-            snprintf(tbuf, sizeof(tbuf), "%02d-%02d %02d:%02d",
-                     tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour, tmv.tm_min);
-            lv_label_set_text(g_stk_time, tbuf);
-            lv_obj_clear_flag(g_stk_time, LV_OBJ_FLAG_HIDDEN);
-        }
+    /* 右下角刷新时间 + 缓存新鲜度状态：由 update_stocks_status() 统一渲染（每秒刷新） */
+    update_stocks_status();
+}
+
+/* ============================================================
+ *  Phase 2 P2 缓存新鲜度：根据最近刷新时刻距今计算 LIVE/CACHED/STALE，
+ *  渲染到行情卡右下角（时间戳 + 状态）。由 clock_tick_cb 每秒调用，
+ *  保证状态随时间流逝实时演进（LIVE -> CACHED -> STALE），而非只在
+ *  fetch 完成时定格。
+ *  阈值（股票交易时段 10 分钟刷新）：
+ *    LIVE   : age < 15min（最近一个刷新周期内，数据为新）
+ *    CACHED : 15min <= age < 26h（休市/夜间/周末，数据来自上次交易段缓存）
+ *    STALE  : age >= 26h（超一天未更新，明显陈旧）
+ * ============================================================ */
+static void update_stocks_status(void)
+{
+    if (!g_stk_card || !g_stk_valid || !g_stk_last_ts) return;
+    time_t now = time(nullptr);
+    if (now <= 1700000000UL) return;   /* NTP 未同步，不判定 */
+
+    uint32_t age = (uint32_t)(now - (time_t)g_stk_last_ts);
+    const char *state;
+    if (age < 15 * 60UL)          state = "LIVE";
+    else if (age < 26 * 3600UL)   state = "CACHED";
+    else                          state = "STALE";
+
+    lv_label_set_text(g_stk_state, state);
+    lv_obj_clear_flag(g_stk_state, LV_OBJ_FLAG_HIDDEN);
+
+    /* 时间戳：仅 NTP 已同步（年份 >= 2025）才显示 */
+    time_t ts = (time_t)g_stk_last_ts;
+    struct tm tmv;
+    localtime_r(&ts, &tmv);
+    if (tmv.tm_year >= 125) {
+        char tbuf[16];
+        snprintf(tbuf, sizeof(tbuf), "%02d-%02d %02d:%02d",
+                 tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour, tmv.tm_min);
+        lv_label_set_text(g_stk_time, tbuf);
+        lv_obj_clear_flag(g_stk_time, LV_OBJ_FLAG_HIDDEN);
     }
 }
 
@@ -779,6 +821,7 @@ static void clock_tick_cb(lv_timer_t *t)
     rtc_process_pending();   /* 若 NTP 已同步，先把系统时间写入 RTC */
     update_cam_status();     /* 摄像头状态栏指示（三态） */
     update_ai_status();      /* AI 手势识别状态指示（三态，Phase 2 P1） */
+    update_stocks_status();  /* 行情缓存新鲜度（LIVE/CACHED/STALE，Phase 2 P2） */
 
     struct tm tm;
     bool ok = rtc_read_time(&tm);
