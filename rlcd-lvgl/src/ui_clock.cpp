@@ -39,6 +39,12 @@ static lv_obj_t *g_fr_bc    = nullptr;    // B 句 中文（单行）
 static lv_obj_t *g_cam_status = nullptr;  // "CAM" 文字（离线时黑底反显）
 static lv_obj_t *g_cam_dot    = nullptr;  // 状态点圆（实心=在线 / 空心=陈旧、离线）
 
+/* ---- 状态栏：AI 手势识别状态（AI + 状态点，Phase 2 P1，全局常驻） ----
+ * 数据来自 M1 finger_page_control 心跳（AI:ALIVE，经 hub/bridge 或 WiFi 8771 传入），
+ * 三态与 CAM 一致：实心=进程活着 / 空心=曾心跳但已超时 / 黑底反显=从未心跳。 */
+static lv_obj_t *g_ai_status = nullptr;   // "AI" 文字
+static lv_obj_t *g_ai_dot    = nullptr;   // 状态点圆
+
 /* ---- 右上：股票指数行情卡（上证/沪深300/创业板指/AI） ----
  * 四行：名称 点位 ▲/▼百分比；上涨=黑底白字反显，下跌=正常黑字。
  * 每行 = 行底条容器(固定 149×20, bg 黑/透明) + 内嵌文本 label。
@@ -279,6 +285,26 @@ void ui_clock_init(lv_obj_t *parent, lv_obj_t *status_bar)
     lv_obj_set_style_pad_all(g_cam_status, 3, 0);
     lv_label_set_text(g_cam_status, "CAM");
     lv_obj_align_to(g_cam_status, g_cam_dot, LV_ALIGN_OUT_LEFT_MID, -2, 0);
+
+    /* ---- AI 手势识别状态（Phase 2 P1）：右对齐到 CAM 左侧，三态同 CAM。
+     * 数据 = M1 finger_page_control 心跳（AI:ALIVE）；update_ai_status() 1s 刷新 ---- */
+    g_ai_dot = lv_obj_create(status_bar);
+    lv_obj_remove_style_all(g_ai_dot);
+    lv_obj_set_size(g_ai_dot, 7, 7);
+    lv_obj_set_style_radius(g_ai_dot, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(g_ai_dot, lv_color_black(), 0);
+    lv_obj_set_style_border_color(g_ai_dot, lv_color_black(), 0);
+    lv_obj_set_style_border_width(g_ai_dot, 1, 0);   /* 初始空心（未收到心跳） */
+    lv_obj_align_to(g_ai_dot, g_cam_status, LV_ALIGN_OUT_LEFT_MID, -4, 0);
+
+    g_ai_status = lv_label_create(status_bar);
+    lv_obj_set_style_text_font(g_ai_status, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(g_ai_status, lv_color_black(), 0);
+    lv_obj_set_style_bg_color(g_ai_status, lv_color_black(), 0);
+    lv_obj_set_style_radius(g_ai_status, 3, 0);
+    lv_obj_set_style_pad_all(g_ai_status, 3, 0);
+    lv_label_set_text(g_ai_status, "AI");
+    lv_obj_align_to(g_ai_status, g_ai_dot, LV_ALIGN_OUT_LEFT_MID, -2, 0);
 
     /* 页面从状态栏下方立即开始，释放原顶部题签占用的 26px。 */
     lv_obj_t *rule = lv_obj_create(parent);
@@ -709,6 +735,42 @@ static void update_cam_status(void)
 }
 
 /* ============================================================
+ *  状态栏 AI 手势识别状态：三态与 CAM 一致（Phase 2 P1）
+ *  数据 = M1 finger_page_control 心跳（AI:ALIVE）：
+ *    fresh（10s 内心跳） = 实心点：进程活着且在处理
+ *    曾心跳但超时      = 空心圈：进程可能卡死/退出
+ *    从未心跳          = 黑底反显：服务未启动/链路不通
+ *  不显示假 FPS——只反映"进程是否活着"这一事实。
+ * ============================================================ */
+static void update_ai_status(void)
+{
+    if (!g_ai_status || !g_ai_dot) return;
+
+    bool fresh = ai_client_is_fresh();
+    bool has   = ai_client_has_beat();
+
+    if (fresh) {
+        lv_obj_set_style_bg_opa(g_ai_status, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_text_color(g_ai_status, lv_color_black(), 0);
+        lv_obj_set_style_bg_opa(g_ai_dot, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(g_ai_dot, 0, 0);
+    } else if (has) {
+        lv_obj_set_style_bg_opa(g_ai_status, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_text_color(g_ai_status, lv_color_black(), 0);
+        lv_obj_set_style_bg_opa(g_ai_dot, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_color(g_ai_dot, lv_color_black(), 0);
+        lv_obj_set_style_border_width(g_ai_dot, 1, 0);
+    } else {
+        lv_obj_set_style_bg_opa(g_ai_status, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(g_ai_status, lv_color_black(), 0);
+        lv_obj_set_style_text_color(g_ai_status, lv_color_white(), 0);
+        lv_obj_set_style_bg_opa(g_ai_dot, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_color(g_ai_dot, lv_color_black(), 0);
+        lv_obj_set_style_border_width(g_ai_dot, 1, 0);
+    }
+}
+
+/* ============================================================
  *  1 秒定时器：读 PCF85063A RTC，刷新数字时钟 + 日期
  * ============================================================ */
 static void clock_tick_cb(lv_timer_t *t)
@@ -716,6 +778,7 @@ static void clock_tick_cb(lv_timer_t *t)
     (void)t;
     rtc_process_pending();   /* 若 NTP 已同步，先把系统时间写入 RTC */
     update_cam_status();     /* 摄像头状态栏指示（三态） */
+    update_ai_status();      /* AI 手势识别状态指示（三态，Phase 2 P1） */
 
     struct tm tm;
     bool ok = rtc_read_time(&tm);

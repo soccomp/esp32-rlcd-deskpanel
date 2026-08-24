@@ -496,6 +496,7 @@ def main():
 
     frames = 0
     t0 = time.time()
+    _last_beat_ts = 0.0      # Phase 2 P1：AI 心跳节流时间戳
     log(f"mediapipe backend = {det.mode}, min_agree={min_agree}, "
         f"win_sec={win_sec}, cooldown={cooldown}, ack_timeout={ACK_TIMEOUT}, "
         f"max_attempts={MAX_ATTEMPTS}, dry_run={args.dry_run}")
@@ -533,7 +534,7 @@ def main():
             ack = hub.ack_queue.get_nowait()
             if not ack.startswith("ACK:"):
                 continue
-            page = ack[4:]                      # "ACK:PAGE:MEETING" -> "PAGE:MEETING"
+            page = ack[4:]                      # "ACK:PAGE:CAMERA" -> "PAGE:CAMERA"
             if page not in PAGE_CMD.values():
                 continue
             if pending is not None and pending["cmd"] == page:
@@ -624,6 +625,19 @@ def main():
                        annotate(bgr, lm, hand, fingers if lm else "-", decision))
             if cv2.waitKey(1) & 0xFF == 27:
                 break
+
+        # ---- Phase 2 P1：AI 健康心跳（每 2s 一次）----
+        # 让 RLCD 状态栏 AI 指示器知道本进程活着。非 dry-run 且命令链路可用时
+        # 发送；dry-run 时跳过（不污染真实链路）。2s < RLCD 侧 10s fresh 窗口，
+        # 即使偶发丢一行也不会误判离线。
+        if not args.dry_run and hub.cmd_ready():
+            now = time.time()
+            if now - _last_beat_ts >= 2.0:
+                _last_beat_ts = now
+                try:
+                    hub.send_cmd("AI:ALIVE")
+                except OSError:
+                    hub.close_cmd_link()   # 链路断开：下轮 ensure_cmd_link 重连
 
         if args.max_frames and frames >= args.max_frames:
             break

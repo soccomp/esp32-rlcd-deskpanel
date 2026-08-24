@@ -77,7 +77,7 @@ noisy = [(True, 2), (True, 2), (False, 0), (True, 2), (True, 3),
          (True, 2), (True, 2), (False, 0), (True, 2)]
 trig = FingerTrigger(min_agree=3, win_sec=3.0, cooldown=1.5)
 new_noisy = simulate(trig, noisy, dt)
-check("S3 新策略 漏检/误数流 仍能触发 PAGE:MEETING", "PAGE:MEETING" in new_noisy)
+check("S3 新策略 漏检/误数流 仍能触发 PAGE:GUITAR", "PAGE:GUITAR" in new_noisy)
 check("S3 旧策略 同样流 几乎不触发(0)", old_strict_triggers(noisy, 5) == 0)
 
 # 场景 4：冷却 + 触发后清窗 —— 同手势不会在 8s 内疯狂重发
@@ -100,22 +100,22 @@ check("S6 无手不触发", simulate(trig, [(False, 0)] * 6, 1.0) == [])
 # 场景 7：切页需要新多数 + 冷却，不瞬间跳（1指->2指）
 trig = FingerTrigger(min_agree=3, win_sec=3.0, cooldown=1.5)
 stream = [(True, 1)] * 4 + [(True, 2)] * 5
-check("S7 1指->2指 顺序正确 [HOME, MEETING]",
-      simulate(trig, stream, 1.0) == ["PAGE:HOME", "PAGE:MEETING"])
+check("S7 1指->2指 顺序正确 [HOME, GUITAR]",
+      simulate(trig, stream, 1.0) == ["PAGE:HOME", "PAGE:GUITAR"])
 
 # ============================================================
 # RLCD-004.2：confirmed_page 权威化（修复"命令已发送即认为已切页"漂移）
-# 复现用户报告的 bug：TRIGGER PAGE:MEETING 后首条命令 ACK 丢失，RLCD 仍是 HOME；
-# 旧逻辑因 last_sent 乐观置为 MEETING，下一相同手势判 already-there 而永久跳过。
+# 复现用户报告的 bug：TRIGGER PAGE:GUITAR 后首条命令 ACK 丢失，RLCD 仍是 HOME；
+# 旧逻辑因 last_sent 乐观置为 GUITAR，下一相同手势判 already-there 而永久跳过。
 # 预填窗口到 min_agree(3) 使 "enough" 成立，再断言决策（避免单帧 no-trigger 干扰）：
 def fill_window(trig, finger, base, n=3):
     for i in range(n):
         trig.window.append((finger, base - i))
 
 
-# S8：构造 drift —— last_sent 乐观=MEETING，但设备真实页 confirmed=HOME
+# S8：构造 drift —— last_sent 乐观=GUITAR，但设备真实页 confirmed=HOME
 trig = FingerTrigger(min_agree=3, win_sec=3.0, cooldown=1.5)
-trig.last_sent = "PAGE:MEETING"          # 旧逻辑的乐观记录（漂移来源）
+trig.last_sent = "PAGE:GUITAR"          # 旧逻辑的乐观记录（漂移来源）
 trig.last_sent_t = 0.0
 fill_window(trig, 2, 100.0)
 dec, _, _ = trig.update(True, 2, 100.0, confirmed_page="PAGE:HOME")
@@ -126,12 +126,12 @@ trig = FingerTrigger(min_agree=3, win_sec=3.0, cooldown=1.5)
 trig.last_sent = "PAGE:HOME"             # 与之无关的乐观值
 trig.last_sent_t = 0.0
 fill_window(trig, 2, 100.0)
-dec, _, _ = trig.update(True, 2, 100.0, confirmed_page="PAGE:MEETING")
-check("S9 confirmed=MEETING 举2指 -> already-there", dec == "already-there")
+dec, _, _ = trig.update(True, 2, 100.0, confirmed_page="PAGE:GUITAR")
+check("S9 confirmed=GUITAR 举2指 -> already-there", dec == "already-there")
 
 # S10：confirmed=None 时回退乐观 last_sent（dry-run 兼容）
 trig = FingerTrigger(min_agree=3, win_sec=3.0, cooldown=1.5)
-trig.last_sent = "PAGE:MEETING"
+trig.last_sent = "PAGE:GUITAR"
 trig.last_sent_t = 0.0
 fill_window(trig, 2, 100.0)
 dec, _, _ = trig.update(True, 2, 100.0, confirmed_page=None)

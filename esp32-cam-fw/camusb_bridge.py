@@ -46,7 +46,9 @@ REPORT_EVERY = 5.0      # 帧率日志间隔（秒）
 
 HUB_HOST, HUB_PORT = "127.0.0.1", 8770  # 本地帧分流 / 命令回注
 # 8-13：会议页已移除，PAGE 白名单改为 HOME / GUITAR / CAMERA（原 MEETING 删除）
-ALLOWED_CMDS = ("PAGE:HOME", "PAGE:GUITAR", "PAGE:CAMERA")
+# Phase 2 P1：新增 AI:ALIVE —— M1 手势进程心跳，透传为 CMD 帧写入 RLCD，
+# RLCD 侧记录心跳时刻驱动状态栏 AI 指示器（不触发切页）。
+ALLOWED_CMDS = ("PAGE:HOME", "PAGE:GUITAR", "PAGE:CAMERA", "AI:ALIVE")
 
 
 def log(msg):
