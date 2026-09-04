@@ -129,9 +129,6 @@ void cmd_feed(uint8_t c)
                  * (2) rx_task 内 printf 与 cam_task/main 的 printf 三方并发访问
                  *     TinyUSB CDC 会卡死 rx_task -> 占满 core0 -> TWDT 重启（实测）。
                  *     日志统一由 main/cam_task 输出，rx_task 纯读 RX。 */
-            } else if (strcmp(g_cmd_buf, "AI:ALIVE") == 0) {
-                /* Phase 2 P1：M1 手势进程心跳，仅记录时刻（不输出避免刷日志） */
-                ai_heartbeat_now();
             }
             g_cmd_len = 0;
         }
@@ -474,12 +471,7 @@ void rx_task(void *arg)
                 if      (strcmp(body, "PAGE:HOME")   == 0) page = 0;
                 else if (strcmp(body, "PAGE:GUITAR") == 0) page = 1;
                 else if (strcmp(body, "PAGE:CAMERA") == 0) page = 2;
-                if (page >= 0) {
-                    g_page_req = page;
-                } else if (strcmp(body, "AI:ALIVE") == 0) {
-                    /* Phase 2 P1：M1 手势进程心跳（bridge 封装 CMD 帧透传） */
-                    ai_heartbeat_now();
-                }
+                if (page >= 0) g_page_req = page;
                 continue;   /* 命令帧不进入视频帧槽 */
             }
             /* 从 free_q 领取一个空闲 slot；无空闲 = 所有 slot 正被 cam_task
@@ -524,11 +516,7 @@ static void cmd_server_task(void *arg)
                         if      (strcmp(line, "PAGE:HOME")   == 0) page = 0;
                         else if (strcmp(line, "PAGE:GUITAR") == 0) page = 1;
                         else if (strcmp(line, "PAGE:CAMERA") == 0) page = 2;
-                        if (page >= 0) {
-                            g_page_req = page;
-                        } else if (strcmp(line, "AI:ALIVE") == 0) {
-                            ai_heartbeat_now();   /* Phase 2 P1：WiFi 模式心跳 */
-                        }
+                        if (page >= 0) g_page_req = page;
                     }
                     li = 0;
                 } else if (li < (int)sizeof(line) - 1) {
@@ -850,23 +838,6 @@ void cam_task(void *arg)
 }
 
 } // namespace
-
-/* Phase 2 P1 —— AI 健康心跳（M1 finger_page_control 上报）。
- * 置于匿名 namespace 外：头文件在 public 位置声明，需 external linkage。
- * g_ai_beat_ms：最近一次收到 "AI:ALIVE" 心跳的时刻（0=从未）。
- * 线程安全：volatile uint32，单次写原子。 */
-volatile uint32_t g_ai_beat_ms = 0;
-#define AI_FRESH_MS 10000UL   /* 10s 内心跳 = 进程活着且在处理 */
-
-void ai_heartbeat_now(void) { g_ai_beat_ms = millis(); }
-bool ai_client_has_beat(void) { return g_ai_beat_ms != 0; }
-bool ai_client_is_fresh(void)
-{
-    if (g_ai_beat_ms == 0) return false;
-    uint32_t now = millis();
-    uint32_t age = (now >= g_ai_beat_ms) ? (now - g_ai_beat_ms) : 0;
-    return (age < AI_FRESH_MS);
-}
 
 /* 带锁 printf（8-12）：rx_task 的 Serial 读与所有任务的 printf 串行化，
  * 防 TinyUSB CDC 跨核并发访问导致 rx_task 卡死（TWDT 重启）。main.cpp 的

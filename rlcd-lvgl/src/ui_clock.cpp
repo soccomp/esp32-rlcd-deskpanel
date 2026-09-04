@@ -39,12 +39,6 @@ static lv_obj_t *g_fr_bc    = nullptr;    // B 句 中文（单行）
 static lv_obj_t *g_cam_status = nullptr;  // "CAM" 文字（离线时黑底反显）
 static lv_obj_t *g_cam_dot    = nullptr;  // 状态点圆（实心=在线 / 空心=陈旧、离线）
 
-/* ---- 状态栏：AI 手势识别状态（AI + 状态点，Phase 2 P1，全局常驻） ----
- * 数据来自 M1 finger_page_control 心跳（AI:ALIVE，经 hub/bridge 或 WiFi 8771 传入），
- * 三态与 CAM 一致：实心=进程活着 / 空心=曾心跳但已超时 / 黑底反显=从未心跳。 */
-static lv_obj_t *g_ai_status = nullptr;   // "AI" 文字
-static lv_obj_t *g_ai_dot    = nullptr;   // 状态点圆
-
 /* ---- 右上：股票指数行情卡（上证/沪深300/创业板指/AI） ----
  * 四行：名称 点位 ▲/▼百分比；上涨=黑底白字反显，下跌=正常黑字。
  * 每行 = 行底条容器(固定 149×20, bg 黑/透明) + 内嵌文本 label。
@@ -59,7 +53,6 @@ static lv_obj_t *g_stk_val_lb[STOCK_ROWS] = {0};  // 每行：点位（右对齐
 static lv_obj_t *g_stk_pct_lb[STOCK_ROWS] = {0};  // 每行：百分比（右对齐，竖列对齐）
 static lv_obj_t *g_stk_loading = nullptr;         // “行情获取中...” 占位
 static lv_obj_t *g_stk_time = nullptr;            // 右下角刷新时间（MM-DD HH:MM，montserrat_12）
-static lv_obj_t *g_stk_state = nullptr;           // Phase 2 P2：缓存新鲜度状态（LIVE/CACHED/STALE）
 
 /* 行情数据缓存：set 侧（网络任务）只写缓存，update 侧（LVGL 任务）渲染 */
 static volatile bool g_stk_valid = false;
@@ -112,7 +105,6 @@ static const lv_coord_t FLIP_CARD_H = 64;   /* 缩小反色黑卡，让时钟居
 static void clock_tick_cb(lv_timer_t *t);
 static void env_tick_cb(lv_timer_t *t);
 static void fr_learn_cb(lv_timer_t *t);       /* 法语学习卡 5 分钟换一组 */
-static void update_stocks_status(void);       /* Phase 2 P2 缓存新鲜度（LIVE/CACHED/STALE） */
 
 /* 法语学习卡：一组对话同屏双语（8-14 替代两条随机短句） */
 static void build_fr_learn_card(lv_obj_t *parent, lv_coord_t x, lv_coord_t y,
@@ -288,26 +280,6 @@ void ui_clock_init(lv_obj_t *parent, lv_obj_t *status_bar)
     lv_label_set_text(g_cam_status, "CAM");
     lv_obj_align_to(g_cam_status, g_cam_dot, LV_ALIGN_OUT_LEFT_MID, -2, 0);
 
-    /* ---- AI 手势识别状态（Phase 2 P1）：右对齐到 CAM 左侧，三态同 CAM。
-     * 数据 = M1 finger_page_control 心跳（AI:ALIVE）；update_ai_status() 1s 刷新 ---- */
-    g_ai_dot = lv_obj_create(status_bar);
-    lv_obj_remove_style_all(g_ai_dot);
-    lv_obj_set_size(g_ai_dot, 7, 7);
-    lv_obj_set_style_radius(g_ai_dot, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_color(g_ai_dot, lv_color_black(), 0);
-    lv_obj_set_style_border_color(g_ai_dot, lv_color_black(), 0);
-    lv_obj_set_style_border_width(g_ai_dot, 1, 0);   /* 初始空心（未收到心跳） */
-    lv_obj_align_to(g_ai_dot, g_cam_status, LV_ALIGN_OUT_LEFT_MID, -4, 0);
-
-    g_ai_status = lv_label_create(status_bar);
-    lv_obj_set_style_text_font(g_ai_status, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(g_ai_status, lv_color_black(), 0);
-    lv_obj_set_style_bg_color(g_ai_status, lv_color_black(), 0);
-    lv_obj_set_style_radius(g_ai_status, 3, 0);
-    lv_obj_set_style_pad_all(g_ai_status, 3, 0);
-    lv_label_set_text(g_ai_status, "AI");
-    lv_obj_align_to(g_ai_status, g_ai_dot, LV_ALIGN_OUT_LEFT_MID, -2, 0);
-
     /* 页面从状态栏下方立即开始，释放原顶部题签占用的 26px。 */
     lv_obj_t *rule = lv_obj_create(parent);
     lv_obj_remove_style_all(rule);
@@ -426,24 +398,12 @@ void ui_clock_init(lv_obj_t *parent, lv_obj_t *status_bar)
     g_stk_time = lv_label_create(g_stk_card);
     lv_obj_set_style_text_font(g_stk_time, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(g_stk_time, lv_color_black(), 0);
-    lv_obj_set_width(g_stk_time, 116);
+    lv_obj_set_width(g_stk_time, 150);
     lv_obj_set_style_text_align(g_stk_time, LV_TEXT_ALIGN_RIGHT, 0);
     lv_label_set_long_mode(g_stk_time, LV_LABEL_LONG_CLIP);
     lv_label_set_text(g_stk_time, "");
-    lv_obj_set_pos(g_stk_time, 48, 96);
+    lv_obj_set_pos(g_stk_time, 6, 96);
     lv_obj_add_flag(g_stk_time, LV_OBJ_FLAG_HIDDEN);
-
-    /* Phase 2 P2：缓存新鲜度状态（LIVE/CACHED/STALE）——时间戳左侧左对齐。
-     * 每秒由 clock_tick_cb -> update_stocks_status() 实时计算刷新。 */
-    g_stk_state = lv_label_create(g_stk_card);
-    lv_obj_set_style_text_font(g_stk_state, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(g_stk_state, lv_color_black(), 0);
-    lv_obj_set_width(g_stk_state, 42);
-    lv_obj_set_style_text_align(g_stk_state, LV_TEXT_ALIGN_LEFT, 0);
-    lv_label_set_long_mode(g_stk_state, LV_LABEL_LONG_CLIP);
-    lv_label_set_text(g_stk_state, "");
-    lv_obj_set_pos(g_stk_state, 8, 96);
-    lv_obj_add_flag(g_stk_state, LV_OBJ_FLAG_HIDDEN);
 
     g_stk_loading = lv_label_create(g_stk_card);
     lv_obj_set_style_text_font(g_stk_loading, &lv_font_chinese_14, 0);
@@ -664,7 +624,6 @@ void ui_clock_update_stocks(void)
     if (!g_stk_valid) {
         lv_obj_clear_flag(g_stk_loading, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(g_stk_time, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(g_stk_state, LV_OBJ_FLAG_HIDDEN);
         for (int i = 0; i < STOCK_ROWS; ++i)
             lv_obj_add_flag(g_stk_bg[i], LV_OBJ_FLAG_HIDDEN);
         return;
@@ -699,45 +658,18 @@ void ui_clock_update_stocks(void)
         lv_obj_clear_flag(g_stk_bg[i], LV_OBJ_FLAG_HIDDEN);
     }
 
-    /* 右下角刷新时间 + 缓存新鲜度状态：由 update_stocks_status() 统一渲染（每秒刷新） */
-    update_stocks_status();
-}
-
-/* ============================================================
- *  Phase 2 P2 缓存新鲜度：根据最近刷新时刻距今计算 LIVE/CACHED/STALE，
- *  渲染到行情卡右下角（时间戳 + 状态）。由 clock_tick_cb 每秒调用，
- *  保证状态随时间流逝实时演进（LIVE -> CACHED -> STALE），而非只在
- *  fetch 完成时定格。
- *  阈值（股票交易时段 10 分钟刷新）：
- *    LIVE   : age < 15min（最近一个刷新周期内，数据为新）
- *    CACHED : 15min <= age < 26h（休市/夜间/周末，数据来自上次交易段缓存）
- *    STALE  : age >= 26h（超一天未更新，明显陈旧）
- * ============================================================ */
-static void update_stocks_status(void)
-{
-    if (!g_stk_card || !g_stk_valid || !g_stk_last_ts) return;
-    time_t now = time(nullptr);
-    if (now <= 1700000000UL) return;   /* NTP 未同步，不判定 */
-
-    uint32_t age = (uint32_t)(now - (time_t)g_stk_last_ts);
-    const char *state;
-    if (age < 15 * 60UL)          state = "LIVE";
-    else if (age < 26 * 3600UL)   state = "CACHED";
-    else                          state = "STALE";
-
-    lv_label_set_text(g_stk_state, state);
-    lv_obj_clear_flag(g_stk_state, LV_OBJ_FLAG_HIDDEN);
-
-    /* 时间戳：仅 NTP 已同步（年份 >= 2025）才显示 */
-    time_t ts = (time_t)g_stk_last_ts;
-    struct tm tmv;
-    localtime_r(&ts, &tmv);
-    if (tmv.tm_year >= 125) {
-        char tbuf[16];
-        snprintf(tbuf, sizeof(tbuf), "%02d-%02d %02d:%02d",
-                 tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour, tmv.tm_min);
-        lv_label_set_text(g_stk_time, tbuf);
-        lv_obj_clear_flag(g_stk_time, LV_OBJ_FLAG_HIDDEN);
+    /* 右下角刷新时间：MM-DD HH:MM（与天气卡获取时间同格式）。仅当 NTP 已同步（年份 >= 2025）才显示 */
+    if (g_stk_last_ts) {
+        time_t ts = (time_t)g_stk_last_ts;
+        struct tm tmv;
+        localtime_r(&ts, &tmv);
+        if (tmv.tm_year >= 125) {
+            char tbuf[16];
+            snprintf(tbuf, sizeof(tbuf), "%02d-%02d %02d:%02d",
+                     tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour, tmv.tm_min);
+            lv_label_set_text(g_stk_time, tbuf);
+            lv_obj_clear_flag(g_stk_time, LV_OBJ_FLAG_HIDDEN);
+        }
     }
 }
 
@@ -777,42 +709,6 @@ static void update_cam_status(void)
 }
 
 /* ============================================================
- *  状态栏 AI 手势识别状态：三态与 CAM 一致（Phase 2 P1）
- *  数据 = M1 finger_page_control 心跳（AI:ALIVE）：
- *    fresh（10s 内心跳） = 实心点：进程活着且在处理
- *    曾心跳但超时      = 空心圈：进程可能卡死/退出
- *    从未心跳          = 黑底反显：服务未启动/链路不通
- *  不显示假 FPS——只反映"进程是否活着"这一事实。
- * ============================================================ */
-static void update_ai_status(void)
-{
-    if (!g_ai_status || !g_ai_dot) return;
-
-    bool fresh = ai_client_is_fresh();
-    bool has   = ai_client_has_beat();
-
-    if (fresh) {
-        lv_obj_set_style_bg_opa(g_ai_status, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_text_color(g_ai_status, lv_color_black(), 0);
-        lv_obj_set_style_bg_opa(g_ai_dot, LV_OPA_COVER, 0);
-        lv_obj_set_style_border_width(g_ai_dot, 0, 0);
-    } else if (has) {
-        lv_obj_set_style_bg_opa(g_ai_status, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_text_color(g_ai_status, lv_color_black(), 0);
-        lv_obj_set_style_bg_opa(g_ai_dot, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_color(g_ai_dot, lv_color_black(), 0);
-        lv_obj_set_style_border_width(g_ai_dot, 1, 0);
-    } else {
-        lv_obj_set_style_bg_opa(g_ai_status, LV_OPA_COVER, 0);
-        lv_obj_set_style_bg_color(g_ai_status, lv_color_black(), 0);
-        lv_obj_set_style_text_color(g_ai_status, lv_color_white(), 0);
-        lv_obj_set_style_bg_opa(g_ai_dot, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_color(g_ai_dot, lv_color_black(), 0);
-        lv_obj_set_style_border_width(g_ai_dot, 1, 0);
-    }
-}
-
-/* ============================================================
  *  1 秒定时器：读 PCF85063A RTC，刷新数字时钟 + 日期
  * ============================================================ */
 static void clock_tick_cb(lv_timer_t *t)
@@ -820,8 +716,6 @@ static void clock_tick_cb(lv_timer_t *t)
     (void)t;
     rtc_process_pending();   /* 若 NTP 已同步，先把系统时间写入 RTC */
     update_cam_status();     /* 摄像头状态栏指示（三态） */
-    update_ai_status();      /* AI 手势识别状态指示（三态，Phase 2 P1） */
-    update_stocks_status();  /* 行情缓存新鲜度（LIVE/CACHED/STALE，Phase 2 P2） */
 
     struct tm tm;
     bool ok = rtc_read_time(&tm);

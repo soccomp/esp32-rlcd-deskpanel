@@ -80,20 +80,16 @@ static String https_get(const char *host, const String &path,
     return body;
 }
 
-/* 提取以 sep 分隔的第 idx 个字段（0-based），不存在返回空串。
- * ★ 8-20 修复：分隔符参数化——腾讯是 '~'，新浪是 ','。
- * 旧实现硬编码 '~'，新浪数据上 indexOf('~') 恒返回 -1 → 新浪备用源
- * 永远解析失败（腾讯失败后直接落到 Mac 后端，违背"腾讯→新浪→后端"
- * 的降级意图）。两者格式见 fetch_tencent / fetch_sina 注释。 */
-static String field_at(const String &s, int idx, char sep = '~')
+/* 提取以 '~' 分隔的第 idx 个字段（0-based），不存在返回空串 */
+static String field_at(const String &s, int idx)
 {
     int pos = 0;
     for (int i = 0; i < idx; i++) {
-        pos = s.indexOf(sep, pos);
+        pos = s.indexOf('~', pos);
         if (pos < 0) return "";
         pos++;
     }
-    int end = s.indexOf(sep, pos);
+    int end = s.indexOf('~', pos);
     if (end < 0) end = s.length();
     return s.substring(pos, end);
 }
@@ -165,8 +161,8 @@ static void fetch_sina(void)
 
         String key     = body.substring(pos, eq);      /* "var hq_str_sh000001" */
         String payload = body.substring(q1 + 1, q2);
-        String cur  = field_at(payload, 3, ',');       /* 现价（, 分隔） */
-        String prev = field_at(payload, 2, ',');       /* 昨收（, 分隔） */
+        String cur  = field_at(payload, 3);            /* 现价 */
+        String prev = field_at(payload, 2);            /* 昨收 */
 
         float p = prev.toFloat();
         if (cur.length() > 0 && p != 0.0f) {
@@ -233,11 +229,11 @@ static bool fetch_backend_stocks(void)
     return g_quote_n > 0;
 }
 
-bool fetch_stocks_data(void)
+void fetch_stocks_data(void)
 {
     if (WiFi.status() != WL_CONNECTED) {
         Serial.println("Stocks fetch skipped: WiFi not connected");
-        return false;
+        return;
     }
 
     g_quote_n = 0;
@@ -258,7 +254,7 @@ bool fetch_stocks_data(void)
         } else {
             Serial.println("[stocks] 后端代理也失败，恢复 SD 缓存");
             load_cached_stocks();
-            return false;   /* P2: 仅旧缓存，非本槽位新数据 → 调用方不推进槽位 */
+            return;
         }
     }
 
@@ -298,7 +294,6 @@ bool fetch_stocks_data(void)
         Serial.println("[stocks] Lvgl_lock 超时，行情 UI 未刷新");
     }
     Serial.printf("[stocks] OK: %d quotes\n", g_quote_n);
-    return true;   /* P2: 拿到本槽位新行情 */
 }
 
 /* 从 SD 缓存恢复行情（直连失败时调用；无缓存则保持现状） */

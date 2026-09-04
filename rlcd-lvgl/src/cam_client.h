@@ -49,17 +49,6 @@ bool cam_client_is_fresh(void);
  * 解析发生在 cam_task，绝不在该任务内直接操作 LVGL 对象。 */
 int8_t cam_client_take_page_cmd(void);
 
-/* Phase 2 P1 —— AI 健康指示（M1 finger_page_control 心跳）。
- * 数据来源：M1 手势识别程序每帧处理完经 hub/WiFi 发 "AI:ALIVE"，
- * bridge 封装 CMD 帧或 WiFi TCP 文本行送入本机；此处记录最近心跳时刻。
- * 三态（与 CAM 一致，不显示假 FPS）：
- *   ai_client_is_fresh(): 心跳在 10s 内 -> true（进程活着且在处理）
- *   ai_client_has_beat(): 曾收到过至少一次心跳（stale 判定用）
- * 线程安全：volatile 时间戳，任意任务可读。 */
-void     ai_heartbeat_now(void);          /* 收到 AI:ALIVE 时调用（cam_task/rx 解析内） */
-bool     ai_client_is_fresh(void);        /* 心跳 10s 内 -> true */
-bool     ai_client_has_beat(void);        /* 曾收到过心跳 */
-
 /* RLCD-004.2（审核修正）：ACK 只在**实际页面状态已确认**后发送。
  * 语义 = "页面已真正切换/已在该页"，而非"命令已收到"。
  * 调用方（main.cpp）必须在 ui_goto_page 成功且 ui_get_current_page()==目标页
