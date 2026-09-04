@@ -30,7 +30,21 @@
    MEMORY SETTINGS
  *=========================*/
 
-#define LV_MEM_CUSTOM 0
+/* 8-31 关键修复：LVGL 对象堆改走 PSRAM（板载 8MB），实现见 lvgl_bsp.cpp。
+ *
+ * 原配置 LV_MEM_CUSTOM=0 + LV_MEM_SIZE=64KB：LVGL 全部对象挤在 64KB 内部 RAM 池里。
+ * 当前 UI 复杂度（首页状态栏+农历+法语卡+行情卡+气象卡 / 吉他页 / 相机页 tileview）
+ * 早已超出该池容量，实测启动时内部堆仅剩 ~92KB，连 SSL 握手都分配失败
+ * （-32512 Memory allocation failed）。
+ *
+ * 后果：密集切页时对象创建/销毁反复耗尽 LVGL 池 -> lv_obj_create 返回 NULL
+ * -> disp->act_scr / top_layer 变野指针 -> 下一个刷新 tick 在
+ * lv_obj_update_layout() 里 LoadProhibited 整机重启。
+ * 此前把 LVGL 任务栈从 8KB 加到 32KB 只能缓解栈溢出，治不了堆耗尽。
+ *
+ * 走 PSRAM 后对象堆不再是瓶颈（8MB），内部 RAM 同时释放约 64KB。
+ * 400x300 单色屏 @2-3fps 下 OPI PSRAM 带宽完全够用。 */
+#define LV_MEM_CUSTOM 1
 #if LV_MEM_CUSTOM == 0
     #define LV_MEM_SIZE (64U * 1024U)
     #define LV_MEM_ADR 0
@@ -40,9 +54,21 @@
     #endif
 #else
     #define LV_MEM_CUSTOM_INCLUDE <stdlib.h>
-    #define LV_MEM_CUSTOM_ALLOC   malloc
-    #define LV_MEM_CUSTOM_FREE    free
-    #define LV_MEM_CUSTOM_REALLOC realloc
+    /* 9-4：lv_conf.h 也会被纯 C 文件（如 brand_logo.c）包含，此时 size_t 尚未
+     * 定义，下面三个函数声明会报 "unknown type name 'size_t'"。显式引入。 */
+    #include <stddef.h>
+    #ifdef __cplusplus
+    extern "C" {
+    #endif
+    void *lv_mem_alloc_psram(size_t size);
+    void  lv_mem_free_psram(void *ptr);
+    void *lv_mem_realloc_psram(void *ptr, size_t size);
+    #ifdef __cplusplus
+    }
+    #endif
+    #define LV_MEM_CUSTOM_ALLOC   lv_mem_alloc_psram
+    #define LV_MEM_CUSTOM_FREE    lv_mem_free_psram
+    #define LV_MEM_CUSTOM_REALLOC lv_mem_realloc_psram
 #endif
 
 #define LV_MEM_BUF_MAX_NUM 16

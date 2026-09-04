@@ -46,7 +46,12 @@ REPORT_EVERY = 5.0      # 帧率日志间隔（秒）
 
 HUB_HOST, HUB_PORT = "127.0.0.1", 8770  # 本地帧分流 / 命令回注
 # 8-13：会议页已移除，PAGE 白名单改为 HOME / GUITAR / CAMERA（原 MEETING 删除）
-ALLOWED_CMDS = ("PAGE:HOME", "PAGE:GUITAR", "PAGE:CAMERA")
+# Phase 2 P1：新增 AI:ALIVE —— M1 手势进程心跳，透传为 CMD 帧写入 RLCD，
+# RLCD 侧记录心跳时刻驱动状态栏 AI 指示器（不触发切页）。
+ALLOWED_CMDS = ("PAGE:HOME", "PAGE:GUITAR", "PAGE:CAMERA", "AI:ALIVE",
+                "GTR:STRUM", "GTR:CHORD", "GTR:GROUP")
+# 9-4：GTR:* —— M1 键盘吉他控制（Ctrl+4 拨弦 / Ctrl+5 下一个和弦 / Ctrl+6 切练习组）。
+# RLCD 侧收到后自动跳到吉他页执行并回 ACK:GTR:xxx（不在我方拦截语义内）。
 
 
 def log(msg):
@@ -226,11 +231,23 @@ class FrameHub:
 
 
 def pump(cam, rlcd, hub):
-    """一次连接内的转发循环；串口异常时抛出，由外层重连。"""
+    """一次连接内的转发循环；串口异常时抛出，由外层重连。
+
+    cam 允许为 None —— 摄像头 USB-TTL 未插/掉线时进入「仅命令」降级模式：
+    仍完整服务 RLCD 的 PAGE 命令通道与 ACK 回执（键盘快捷键切页依赖此通道），
+    只是不转发视频帧。摄像头重新出现后本函数返回，外层重连进入完整模式。
+    9-4：此前 cam 缺失时 main() 直接 continue，hub 虽在监听却无人把命令写进
+    RLCD，导致 Ctrl+1/2/3 静默失效（快捷键"不好用"的真正原因）。
+    """
     buf = bytearray()
     rlcd_line_buf = bytearray()     # RLCD TX 行缓冲（解析 ACK）
     ok = bad = 0
     last_report = time.time()
+    last_rescan = 0.0
+
+    if cam is None:
+        log("degraded mode: cam absent -> RLCD command channel only "
+            "(page switching alive, no video frames)")
 
     while True:
         # 8-13 修复：命令写在每轮开头（读帧前）——此时上一视频帧已处理完
@@ -251,42 +268,53 @@ def pump(cam, rlcd, hub):
             write_all(rlcd, pkt)
             log(f"cmd -> RLCD: {cmd}")
 
-        chunk = cam.read(65536)
-        if chunk:
-            buf.extend(chunk)
+        if cam is not None:
+            chunk = cam.read(65536)
+            if chunk:
+                buf.extend(chunk)
 
-        while True:
-            idx = buf.find(HEAD)
-            if idx < 0:
-                if len(buf) > 4:
-                    del buf[:-3]       # 只留可能被截断的帧头前缀
-                break
-            if idx > 0:
-                del buf[:idx]
-            if len(buf) < 6:
-                break
-            flen = (buf[4] << 8) | buf[5]
-            if flen <= 0 or flen > 100000:
-                del buf[:2]            # 伪帧头，跳过重新搜索
-                continue
-            need = 6 + flen + 2
-            if len(buf) < need:
-                break
+            while True:
+                idx = buf.find(HEAD)
+                if idx < 0:
+                    if len(buf) > 4:
+                        del buf[:-3]       # 只留可能被截断的帧头前缀
+                    break
+                if idx > 0:
+                    del buf[:idx]
+                if len(buf) < 6:
+                    break
+                flen = (buf[4] << 8) | buf[5]
+                if flen <= 0 or flen > 100000:
+                    del buf[:2]            # 伪帧头，跳过重新搜索
+                    continue
+                need = 6 + flen + 2
+                if len(buf) < need:
+                    break
 
-            frame = bytes(buf[6:6 + flen])
-            crc_r = (buf[6 + flen] << 8) | buf[6 + flen + 1]
-            crc_c = flen & 0xFFFF
-            for b in frame:
-                crc_c = (crc_c + b) & 0xFFFF
-            del buf[:need]
+                frame = bytes(buf[6:6 + flen])
+                crc_r = (buf[6 + flen] << 8) | buf[6 + flen + 1]
+                crc_c = flen & 0xFFFF
+                for b in frame:
+                    crc_c = (crc_c + b) & 0xFFFF
+                del buf[:need]
 
-            if crc_c == crc_r:
-                packet = HEAD + flen.to_bytes(2, "big") + frame + crc_r.to_bytes(2, "big")
-                write_all(rlcd, packet)
-                hub.publish(packet)
-                ok += 1
-            else:
-                bad += 1
+                if crc_c == crc_r:
+                    packet = HEAD + flen.to_bytes(2, "big") + frame + crc_r.to_bytes(2, "big")
+                    write_all(rlcd, packet)
+                    hub.publish(packet)
+                    ok += 1
+                else:
+                    bad += 1
+        else:
+            # 降级模式：无帧可读，让出 CPU；并定期重扫摄像头，一旦出现就返回，
+            # 由外层重新 resolve 端口，自动升级为完整（视频+命令）模式。
+            now = time.time()
+            if now - last_rescan >= RETRY_WAIT:
+                last_rescan = now
+                if find_cam_port():
+                    log("cam reappeared -> reconnecting in full mode")
+                    return
+            time.sleep(0.02)
 
         # RLCD-004.2：读取 RLCD 的 USB-CDC TX，把 ``ACK:PAGE:X`` 回执转发给 hub 客户端
         rlcd_wait = rlcd.in_waiting
@@ -309,14 +337,16 @@ def pump(cam, rlcd, hub):
                         log(f"rlcd!: {s}")
                     # ACK 提取：RLCD 的 Serial.printf 偶发与其它日志粘连/换行丢失
                     # （如 "[cmd] PAGE:GUITAR -> paACK:PAGE:GUITAR"），行首匹配会漏掉，
-                    # 因此改为在整行内搜索 "ACK:PAGE:" 子串，粘连也能提取转发。
+                    # 因此改为在整行内搜索 "ACK:" 子串，粘连也能提取转发。
+                    # 9-4：通用化为任意白名单 token（PAGE:x / GTR:xxx）——
+                    # 键盘吉他命令的 ACK:GTR:STRUM 等也要能透传给 hub 客户端。
                     k = 0
                     while True:
-                        k = s.find("ACK:PAGE:", k)
+                        k = s.find("ACK:", k)
                         if k < 0:
                             break
-                        e = k + 10                       # len("ACK:PAGE:")
-                        while e < len(s) and (s[e].isalpha() or s[e] == '_'):
+                        e = k + 4                       # len("ACK:")
+                        while e < len(s) and (s[e].isalpha() or s[e] in "_:"):
                             e += 1
                         tok = s[k:e]
                         if tok.startswith("ACK:") and tok[4:] in ALLOWED_CMDS:
@@ -326,8 +356,9 @@ def pump(cam, rlcd, hub):
 
         now = time.time()
         if now - last_report >= REPORT_EVERY:
-            log(f"ok={ok} bad={bad} ~{ok / (now - last_report):.1f}fps")
-            ok = bad = 0
+            if cam is not None:
+                log(f"ok={ok} bad={bad} ~{ok / (now - last_report):.1f}fps")
+                ok = bad = 0
             last_report = now
 
 
@@ -343,27 +374,33 @@ def main():
         cam = rlcd = None
         try:
             cam_port, rlcd_port = resolve_ports(cam_arg, rlcd_arg)
-            if not cam_port or not rlcd_port:
+            # 9-4：只有 RLCD 缺失才需要干等；摄像头缺失不再阻塞 —— 降级为
+            # 「仅命令」模式，切页快捷键照常可用（视频帧暂缺）。
+            if not rlcd_port:
                 if not waiting_logged:      # 只打一次，避免刷爆日志
-                    log(f"waiting for devices (cam={cam_port or 'missing'} "
-                        f"rlcd={rlcd_port or 'missing'})")
+                    log(f"waiting for RLCD (rlcd=missing)")
                     waiting_logged = True
                 time.sleep(RETRY_WAIT)
                 continue
             waiting_logged = False
 
-            cam = serial.Serial(cam_port, CAM_BAUD, timeout=0.3)
-            cam.rts = False
-            cam.dtr = False
-            time.sleep(1.2)                 # 打开 CH340 会触发摄像头复位，等它启动
-            cam.reset_input_buffer()
+            cam = None
+            if cam_port:
+                cam = serial.Serial(cam_port, CAM_BAUD, timeout=0.3)
+                cam.rts = False
+                cam.dtr = False
+                time.sleep(1.2)             # 打开 CH340 会触发摄像头复位，等它启动
+                cam.reset_input_buffer()
 
             rlcd = serial.Serial(rlcd_port, RLCD_BAUD, timeout=0.1)
             time.sleep(0.3)
             rlcd.reset_output_buffer()
             rlcd.reset_input_buffer()      # 丢弃 RLCD 启动期日志积压，只关心后续 ACK
 
-            log(f"{cam_port}@{CAM_BAUD} -> {rlcd_port}@{RLCD_BAUD}")
+            if cam:
+                log(f"{cam_port}@{CAM_BAUD} -> {rlcd_port}@{RLCD_BAUD}")
+            else:
+                log(f"cam=none -> {rlcd_port}@{RLCD_BAUD} (command-only)")
             pump(cam, rlcd, hub)
 
         except KeyboardInterrupt:

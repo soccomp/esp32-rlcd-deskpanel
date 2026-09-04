@@ -52,6 +52,11 @@ bool      g_ready = false;
  * g_ack_pending：main loop 切页确认后置位，cmd_server_task 在同一 TCP 连接上回 ACK。 */
 volatile int8_t g_page_req   = -1;    /* 待处理页面请求（-1 无） */
 volatile int8_t g_ack_pending = -1;   /* 待回 ACK 的页（-1 无） */
+/* 9-4：M1 键盘吉他控制（GTR:STRUM/CHORD/GROUP）。请求与 ACK 各一条通道，
+ * 与页面通道相互独立；USB(rx_task) 与 WiFi(cmd_server_task) 双入口登记，
+ * main loop 统一取走执行（取走即清 -1，同一命令只执行一次）。 */
+volatile int8_t g_gtr_req        = -1;  /* 0=STRUM 1=CHORD 2=GROUP（-1 无） */
+volatile int8_t g_gtr_ack_pending = -1; /* WiFi 客户端待回 GTR ACK（-1 无） */
 WiFiServer g_cmd_server(8771);       /* M1 手势程序经 WiFi 下发 PAGE 命令 */
 WiFiClient g_cmd_client;              /* 当前连上的手势客户端（用于回 ACK） */
 
@@ -129,6 +134,9 @@ void cmd_feed(uint8_t c)
                  * (2) rx_task 内 printf 与 cam_task/main 的 printf 三方并发访问
                  *     TinyUSB CDC 会卡死 rx_task -> 占满 core0 -> TWDT 重启（实测）。
                  *     日志统一由 main/cam_task 输出，rx_task 纯读 RX。 */
+            } else if (strcmp(g_cmd_buf, "AI:ALIVE") == 0) {
+                /* Phase 2 P1：M1 手势进程心跳，仅记录时刻（不输出避免刷日志） */
+                ai_heartbeat_now();
             }
             g_cmd_len = 0;
         }
@@ -471,7 +479,18 @@ void rx_task(void *arg)
                 if      (strcmp(body, "PAGE:HOME")   == 0) page = 0;
                 else if (strcmp(body, "PAGE:GUITAR") == 0) page = 1;
                 else if (strcmp(body, "PAGE:CAMERA") == 0) page = 2;
-                if (page >= 0) g_page_req = page;
+                if (page >= 0) {
+                    g_page_req = page;
+                } else if (strcmp(body, "GTR:STRUM") == 0) {
+                    g_gtr_req = 0;       /* 9-4：M1 键盘拨弦 */
+                } else if (strcmp(body, "GTR:CHORD") == 0) {
+                    g_gtr_req = 1;       /* 下一个和弦 */
+                } else if (strcmp(body, "GTR:GROUP") == 0) {
+                    g_gtr_req = 2;       /* 切练习组 OPEN/7TH */
+                } else if (strcmp(body, "AI:ALIVE") == 0) {
+                    /* Phase 2 P1：M1 手势进程心跳（bridge 封装 CMD 帧透传） */
+                    ai_heartbeat_now();
+                }
                 continue;   /* 命令帧不进入视频帧槽 */
             }
             /* 从 free_q 领取一个空闲 slot；无空闲 = 所有 slot 正被 cam_task
@@ -516,7 +535,17 @@ static void cmd_server_task(void *arg)
                         if      (strcmp(line, "PAGE:HOME")   == 0) page = 0;
                         else if (strcmp(line, "PAGE:GUITAR") == 0) page = 1;
                         else if (strcmp(line, "PAGE:CAMERA") == 0) page = 2;
-                        if (page >= 0) g_page_req = page;
+                        if (page >= 0) {
+                            g_page_req = page;
+                        } else if (strcmp(line, "GTR:STRUM") == 0) {
+                            g_gtr_req = 0;   /* 9-4：WiFi 通道同样支持吉他控制 */
+                        } else if (strcmp(line, "GTR:CHORD") == 0) {
+                            g_gtr_req = 1;
+                        } else if (strcmp(line, "GTR:GROUP") == 0) {
+                            g_gtr_req = 2;
+                        } else if (strcmp(line, "AI:ALIVE") == 0) {
+                            ai_heartbeat_now();   /* Phase 2 P1：WiFi 模式心跳 */
+                        }
                     }
                     li = 0;
                 } else if (li < (int)sizeof(line) - 1) {
@@ -536,6 +565,19 @@ static void cmd_server_task(void *arg)
                 cam_client_log("[cmd] ACK sent: %s\n", name);
             }
             g_ack_pending = -1;
+        }
+        /* 9-4：吉他命令的 WiFi ACK（执行成功后由 main loop 置位） */
+        if (g_gtr_ack_pending >= 0 && g_cmd_client && g_cmd_client.connected()) {
+            const char *gname = (g_gtr_ack_pending == 0) ? "GTR:STRUM" :
+                                (g_gtr_ack_pending == 1) ? "GTR:CHORD" :
+                                (g_gtr_ack_pending == 2) ? "GTR:GROUP" : nullptr;
+            if (gname) {
+                g_cmd_client.print("ACK:");
+                g_cmd_client.print(gname);
+                g_cmd_client.print("\n");
+                cam_client_log("[cmd] ACK sent: %s\n", gname);
+            }
+            g_gtr_ack_pending = -1;
         }
         vTaskDelay(pdMS_TO_TICKS(10));
     }
@@ -839,6 +881,23 @@ void cam_task(void *arg)
 
 } // namespace
 
+/* Phase 2 P1 —— AI 健康心跳（M1 finger_page_control 上报）。
+ * 置于匿名 namespace 外：头文件在 public 位置声明，需 external linkage。
+ * g_ai_beat_ms：最近一次收到 "AI:ALIVE" 心跳的时刻（0=从未）。
+ * 线程安全：volatile uint32，单次写原子。 */
+volatile uint32_t g_ai_beat_ms = 0;
+#define AI_FRESH_MS 10000UL   /* 10s 内心跳 = 进程活着且在处理 */
+
+void ai_heartbeat_now(void) { g_ai_beat_ms = millis(); }
+bool ai_client_has_beat(void) { return g_ai_beat_ms != 0; }
+bool ai_client_is_fresh(void)
+{
+    if (g_ai_beat_ms == 0) return false;
+    uint32_t now = millis();
+    uint32_t age = (now >= g_ai_beat_ms) ? (now - g_ai_beat_ms) : 0;
+    return (age < AI_FRESH_MS);
+}
+
 /* 带锁 printf（8-12）：rx_task 的 Serial 读与所有任务的 printf 串行化，
  * 防 TinyUSB CDC 跨核并发访问导致 rx_task 卡死（TWDT 重启）。main.cpp 的
  * [cmd] 日志与 cam_client 内部日志统一走这里。置于 namespace 外供 main 调用。 */
@@ -914,12 +973,17 @@ void cam_client_init(void)
     xTaskCreatePinnedToCore(rx_task, "camrx", 4096, nullptr, 6, nullptr, 0);
     xTaskCreatePinnedToCore(cam_task, "camfetch", 8192, nullptr, 4, nullptr, 1);
 #else
-    /* 方案B：WiFi 命令服务（PAGE 命令 + ACK 回执），与帧取回并存 */
-    g_cmd_server.begin();
-    xTaskCreate(cmd_server_task, "camcmd", 4096, nullptr, 4, nullptr);
+    /* 方案B：WiFi 模式下摄像头走 WiFi 取帧，无 rx_task */
     /* 栈 8192：VGA 640x480 全尺寸解码（TJpgDec 内部 MCU 缓冲 + 裁切）需要大栈 */
     xTaskCreate(cam_task, "camfetch", 8192, nullptr, 4, nullptr);
 #endif
+    /* ★ 8-31：WiFi 命令服务（8771）改为两种模式都常开——Mac 端键盘/手势切页
+     * 不再依赖摄像头链路，无线通道独立可用。cmd_server_task 无 CAM_USB_INPUT 依赖
+     * （仅用 g_cmd_client/g_page_req/ai_heartbeat_now/cam_client_log），安全。
+     * 与 USB-CDC 命令通道（rx_task/cmd_feed）互不冲突：都只登记 g_page_req，
+     * 由 main loop 统一取走执行；ACK 由 cam_client_send_ack 分发（见下）。 */
+    g_cmd_server.begin();
+    xTaskCreate(cmd_server_task, "camcmd", 4096, nullptr, 4, nullptr);
     Serial.println("[cam] cam_client started (2fps, QVGA grayscale)");
     /* 8-12 诊断：复位原因（1=POWERON 3=SW 4=PANIC 5=INT_WDT 6=TASK_WDT 7=WDT
      * 9=BROWNOUT），区分崩溃类型（PANIC=程序异常/断言；WDT=任务饿死） */
@@ -962,30 +1026,56 @@ int8_t cam_client_take_page_cmd(void)
 #endif
 }
 
+int8_t cam_client_take_gtr_cmd(void)
+{
+    int8_t g = g_gtr_req;
+    if (g >= 0) g_gtr_req = -1;    /* 取走即清空（USB/WiFi 双入口共用） */
+    return g;
+}
+
 /* RLCD-004.2 审核修正：ACK 只在**实际页面状态已确认**后发送（main.cpp 调用）。
  * 调用时机必须是：ui_goto_page 成功且 ui_get_current_page()==目标页，或已在目标页。
  * Lvgl_lock 失败/切页未生效时不得调用，让 M1 超时重发。 */
 void cam_client_send_ack(int8_t page)
 {
-#ifdef CAM_USB_INPUT
     const char *name = (page == 0) ? "PAGE:HOME" :
                        (page == 1) ? "PAGE:GUITAR" :
                        (page == 2) ? "PAGE:CAMERA" : nullptr;
-    if (name) {
-        /* 8-13 修复：ACK 必须可靠送达——用阻塞写，绝不用非阻塞丢弃。
-         * 根因：RLCD 日志多（[cam]48帧/次 + [cam-ui]6帧/次 + 天气 + [cmd]）
-         * 使 TX 持续满，非阻塞 printf 全部丢弃（含 ACK）-> M1 收不到 ACK
-         * 超时重发（30 条注入实测仅 46% ACK；手动测试无 TX 竞争则 4/4）。
-         * ACK 为短行（14B），TinyUSB TX 缓冲常有空位，阻塞时间极短。 */
-        if (g_serial_lock && !xSemaphoreTake(g_serial_lock, pdMS_TO_TICKS(100))) return;
-        Serial.print("ACK:");
-        Serial.print(name);
-        Serial.print("\n");
-        if (g_serial_lock) xSemaphoreGive(g_serial_lock);
-    }
-#else
-    /* 方案B：仅置 g_ack_pending，由 cmd_server_task 在同一 TCP 连接上回 ACK
-     * （socket I/O 集中在该任务，避免跨任务写同一 socket）。 */
-    if (page >= 0 && page <= 2) g_ack_pending = page;
+    if (!name) return;
+#ifdef CAM_USB_INPUT
+    /* 8-13 修复：ACK 必须可靠送达——用阻塞写，绝不用非阻塞丢弃。
+     * 根因：RLCD 日志多（[cam]48帧/次 + [cam-ui]6帧/次 + 天气 + [cmd]）
+     * 使 TX 持续满，非阻塞 printf 全部丢弃（含 ACK）-> M1 收不到 ACK
+     * 超时重发（30 条注入实测仅 46% ACK；手动测试无 TX 竞争则 4/4）。
+     * ACK 为短行（14B），TinyUSB TX 缓冲常有空位，阻塞时间极短。 */
+    if (g_serial_lock && !xSemaphoreTake(g_serial_lock, pdMS_TO_TICKS(100))) return;
+    Serial.print("ACK:");
+    Serial.print(name);
+    Serial.print("\n");
+    if (g_serial_lock) xSemaphoreGive(g_serial_lock);
 #endif
+    /* ★ 8-31：WiFi 命令服务（8771）两种模式都常开——这里同时置 g_ack_pending，
+     * cmd_server_task 会顺带往当前连接的 WiFi 客户端回 ACK（无客户端时该标志
+     * 保留，下次连接消费；可能被下一条命令覆盖，无害）。USB 命令的 ACK 走
+     * Serial（上），WiFi 命令的 ACK 走 TCP（cmd_server_task），互不冲突。 */
+    if (page >= 0 && page <= 2) g_ack_pending = page;
+}
+
+/* 9-4：吉他命令 ACK（GTR:STRUM/CHORD/GROUP 执行成功后由 main.cpp 调用）。
+ * 语义与 cam_client_send_ack 相同：只在动作实际生效后回执。
+ * USB 通道走 Serial（bridge 整行搜 "ACK:" 转发 hub），WiFi 通道走 TCP。 */
+void cam_client_send_gtr_ack(int8_t kind)
+{
+    const char *name = (kind == 0) ? "GTR:STRUM" :
+                       (kind == 1) ? "GTR:CHORD" :
+                       (kind == 2) ? "GTR:GROUP" : nullptr;
+    if (!name) return;
+#ifdef CAM_USB_INPUT
+    if (g_serial_lock && !xSemaphoreTake(g_serial_lock, pdMS_TO_TICKS(100))) return;
+    Serial.print("ACK:");
+    Serial.print(name);
+    Serial.print("\n");
+    if (g_serial_lock) xSemaphoreGive(g_serial_lock);
+#endif
+    if (kind >= 0 && kind <= 2) g_gtr_ack_pending = kind;
 }

@@ -198,6 +198,31 @@ static int      g_wifi_ok_idx = -1;
 static uint8_t  g_wifi_ok_bssid[6] = {0};
 static int32_t  g_wifi_ok_ch = 0;
 
+/* ★ 8-20（Phase 2 P1）统一 WiFi 恢复入口：**首次连接与断线重连走同一函数**。
+ * 旧实现把"刚连上拉数据"逻辑内联在 loop 的 g_wifi_prev 翻转分支里，
+ * 且 30s 重连分支成功后又手动置 g_wifi_prev=true 而跳过恢复——隐藏状态 bug：
+ *   - 断线后 g_wifi_prev 要等 1s tick 才变 false，若 tick 未跑而重连分支已置 true，
+ *     则 connected != g_wifi_prev 恒假，数据恢复/摄像头启动被永久跳过；
+ *   - 预防性 hard restart（未真正掉线）成功后同样不恢复。
+ * 正解：连接就绪（无论首次/重连/硬重启后）统一走本函数刷新数据面。
+ * 幂等：cam_client_init 内部防重；天气/行情由各自定时器节流，重复调用安全。 */
+static void wifi_on_connected(void)
+{
+    /* 刚连上：立即拉取一次行情 + 直连天气 + 启动摄像头客户端 */
+    g_last_stocks = millis();
+    g_last_stocks_slot = -1;       /* P2: 重连后重新从当前槽位开始 */
+    fetch_stocks_data();         /* 行情：连上即拉一次 */
+    g_last_weather = millis();
+    weather_result_t wr = fetch_weather_data();
+    g_weather_ready = (wr == WEATHER_OK);
+    g_weather_permanent = (wr == WEATHER_PERMANENT);
+    if (g_weather_ready) g_weather_fail_cnt = 0;
+    else g_weather_fail_cnt++;
+    cam_client_init();   // 幂等：内部防重复初始化，离线时任务自行退避重试
+    Serial.printf("WiFi connected, IP=%s (services refreshed)\n",
+                  WiFi.localIP().toString().c_str());
+}
+
 static void start_wifi(void)
 {    if (wifi_count == 0) return;
     setenv("TZ", "CST-8", 1);
@@ -252,6 +277,7 @@ static void start_wifi(void)
             Serial.printf("[WiFi] 已连接 \"%s\", IP=%s ch=%d\n",
                           wifi_list[i].ssid, WiFi.localIP().toString().c_str(),
                           (int)g_wifi_ok_ch);
+            wifi_on_connected();   /* 首次连接：统一恢复数据面 */
             break;  // 连上了就不再试下一个
         }
         Serial.printf("[WiFi] \"%s\" 连接失败，尝试下一个\n", wifi_list[i].ssid);
@@ -291,6 +317,7 @@ void wifi_hard_restart(void)
             Serial.printf("[wifi] fast reconnect OK in %ums, IP=%s ch=%d\n",
                           (unsigned)(millis() - t0),
                           WiFi.localIP().toString().c_str(), (int)WiFi.channel());
+            wifi_on_connected();   /* 硬重启后统一恢复数据面（Phase 2 P1） */
             return;
         }
         Serial.println("[wifi] fast reconnect failed, fall back to full scan");
@@ -298,6 +325,53 @@ void wifi_hard_restart(void)
     }
     start_wifi();               /* 慢路径：mode(STA) + 列表轮询 */
     Serial.printf("[wifi] hard restart done in %ums\n", (unsigned)(millis() - t0));
+}
+
+/* ★ 8-20（Phase 2 P1）WiFi 数据面健康探测：轻量 TCP 连网关。
+ * 语义与 cam_client.cpp 的 local_tcp_stack_alive 一致，但独立实现避免跨模块耦合：
+ *   - ECONNREFUSED(111) 也算健康（收到 RST = 包一来一回都通，仅网关没开 80 端口）
+ *   - ETIMEDOUT(116) = SYN 无回应 → 数据面确实死了
+ * 非阻塞 connect + select，超时 800ms（同网段网关 RTT 实测 <50ms，余量 16 倍）。
+ * 只在 WiFi 关联时调用；每次新建短连接立即归还，无资源累积。 */
+static bool wifi_data_alive(void)
+{
+    IPAddress gw = WiFi.gatewayIP();
+    if ((uint32_t)gw == 0) return false;
+
+    int fd = lwip_socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return false;
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family      = AF_INET;
+    sa.sin_port        = htons(80);
+    sa.sin_addr.s_addr = (uint32_t)gw;
+
+    int rc = lwip_connect(fd, (struct sockaddr *)&sa, sizeof(sa));
+    if (rc == 0) { lwip_close(fd); return true; }
+    if (errno != EINPROGRESS) {
+        bool ok = (errno == ECONNREFUSED);
+        lwip_close(fd);
+        return ok;
+    }
+
+    fd_set wr;
+    FD_ZERO(&wr);
+    FD_SET(fd, &wr);
+    struct timeval tv = {0, 800000};   /* 800ms */
+    rc = lwip_select(fd + 1, nullptr, &wr, nullptr, &tv);
+    bool ok;
+    if (rc <= 0) {
+        ok = false;                    /* 超时/错误：SYN 无响应 */
+    } else {
+        int soerr = 0;
+        socklen_t slen = sizeof(soerr);
+        lwip_getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &slen);
+        ok = (soerr == 0 || soerr == ECONNREFUSED);
+    }
+    lwip_close(fd);
+    return ok;
 }
 
 // GPIO4 电池电压 ADC（3 倍分压）：18650 锂电 2.7V=空 ~ 4.2V=满
@@ -402,17 +476,47 @@ void loop()
 {
     ArduinoOTA.handle();   // 必须频繁调用，保证 OTA 能及时响应
 
-    /* ★ 8-19 预防性重关联（AP 对 ESP32 下发 A-MPDU 聚合下行帧，周期性 30~60s
-     * 让 RX 解不出→"假在线"；每次重关联重置 AP 聚合状态即恢复）。在楔死发生前
-     * 主动重连，永远停在健康窗口，使数据面楔死不暴露于用户路径。12s < 楔死周期(~14s)，
-     * 余量充足；wifi_hard_restart 已含快速重连（定频直连，~1s 完成）。 */
+    /* ★ 8-20（Phase 2 P1）健康度驱动 WiFi 自愈（替换原无条件 12s hard restart）。
+     *
+     * 背景/硬件证据（决定保留周期性检查节奏）：AP 对 ESP32 下发 A-MPDU 聚合下行帧，
+     * 周期性 30~60s 让 RX 解不出 → "假在线"（关联在、beacon 收得到，但单播数据面
+     * 双向死亡）。每次重关联重置 AP 聚合状态即恢复；12s < 楔死周期(~14s) 是实测
+     * 有效余量。但**不再无条件每 12s 硬重启**——否则永远停在高频重启，任务书 P1
+     * 明确要求"workaround 不应是最终架构"。
+     *
+     * 新逻辑：每 12s 用轻量 TCP 探测网关判断数据面是否真的健康：
+     *   - HEALTHY（探测通过）→ 什么都不做（不重启，节省重启开销）
+     *   - 连续 FAIL（数据面确死）→ wifi_hard_restart()（重关联重建 PTK/GTK）
+     *   - 连续 hard restart 多次仍失败 → esp_restart()（最终兜底）
+     * 探测只连网关（同网段 <50ms），开销远小于一次 2~4s 的重关联。 */
     {
-        static uint32_t s_prev_reassoc = 0;
-        if (millis() - s_prev_reassoc > 12000UL) {
-            s_prev_reassoc = millis();
+        static uint32_t s_prev_health_check = 0;
+        static uint32_t s_health_fail_cnt   = 0;   /* 连续失败次数 */
+        if (millis() - s_prev_health_check > 12000UL) {
+            s_prev_health_check = millis();
             if (WiFi.status() == WL_CONNECTED) {
-                Serial.println("[wifi] preventive hard restart (ampdu-downlink workaround)");
-                wifi_hard_restart();
+                if (wifi_data_alive()) {
+                    if (s_health_fail_cnt > 0) {
+                        Serial.printf("[wifi] data plane healthy again (after %u fails)\n",
+                                      (unsigned)s_health_fail_cnt);
+                        s_health_fail_cnt = 0;
+                    }
+                } else {
+                    s_health_fail_cnt++;
+                    Serial.printf("[wifi] data plane probe FAIL #%u -> recover\n",
+                                  (unsigned)s_health_fail_cnt);
+                    /* 升级阶梯：确认失败才 hard restart（≥1 次失败即触发，
+                     * 连续 6 次 hard restart 救不回才整机重启） */
+                    if (s_health_fail_cnt >= 6) {
+                        Serial.println("[wifi] recovery x6 ineffective, rebooting");
+                        delay(200);
+                        esp_restart();
+                    } else {
+                        wifi_hard_restart();   /* 重连成功会经 wifi_on_connected 恢复数据 */
+                    }
+                }
+            } else {
+                s_health_fail_cnt = 0;   /* 掉线由 loop 的 30s 重连分支处理 */
             }
         }
     }
@@ -515,6 +619,82 @@ void loop()
         }
     }
 
+    /* ----- 9-4：M1 键盘吉他控制（GTR:STRUM / GTR:CHORD / GTR:GROUP）-----
+     * 与 PAGE 命令同一套模式：rx_task/WiFi 只登记，loop 里 Lvgl_lock 内执行。
+     * 关键稳定性修复：不在吉他页时**先切过去、把动作挂起**，等页面稳定
+     * （≥120ms，经历数次 LVGL 刷新）后再执行——绝不在"切页"同一次内立即
+     * 重绘吉他 canvas。实测"切页+立即重绘"会让刚可见、尚未被 LVGL 任务首渲
+     * 的 canvas 被二次重绘+音频叠加，踩坏 LVGL 显示对象
+     * （disp->driver->draw_ctx 变 0 -> draw_buf_flush LoadProhibited 重启）。
+     * 这与物理按键只在吉他页才拨弦的行为一致（物理 BOOT 短按 ui_get_current_page()
+     * 非 1 时根本不调 ui_ambient_tap）。动作实际生效后才回 ACK:GTR:xxx。 */
+    {
+        static volatile int8_t   g_gtr_pending = -1;   /* 挂起的 GTR 动作 0/1/2（-1 无） */
+        static volatile uint32_t g_gtr_pending_at = 0; /* 挂起时刻（millis） */
+        int8_t gtr = cam_client_take_gtr_cmd();
+        if (gtr >= 0) {
+            const char *gname = (gtr == 0) ? "GTR:STRUM" :
+                                (gtr == 1) ? "GTR:CHORD" : "GTR:GROUP";
+            if (ui_get_current_page() != 1) {
+                /* 先跳到吉他页；动作挂起稍后执行，避免切页+立即重绘踩踏 */
+                if (Lvgl_lock(1000)) {
+                    ui_goto_page(1);
+                    Lvgl_unlock();
+                }
+                g_gtr_pending = gtr;
+                g_gtr_pending_at = millis();
+                cam_client_log("[cmd] %s -> goto GUITAR (action deferred)\n", gname);
+            } else {
+                /* 已在吉他页：直接执行（与物理按键同路径，已验证安全） */
+                bool ok = false;
+                if (Lvgl_lock(1000)) {
+                    if (gtr == 0)      ui_ambient_tap();
+                    else if (gtr == 1) ui_ambient_next_chord();
+                    else               ui_ambient_next_group();
+                    ok = true;
+                    Lvgl_unlock();
+                } else {
+                    cam_client_log("[cmd] %s Lvgl_lock failed, no ACK\n", gname);
+                }
+                if (ok) {
+                    cam_client_send_gtr_ack(gtr);
+                    cam_client_log("[cmd] %s done (gesture)\n", gname);
+                }
+            }
+        }
+        /* 挂起动作：已在吉他页且距挂起 ≥120ms（页面已稳定、canvas 已首渲）后执行。
+         * 注意：必须用 millis() 实时算 elapsed，不能复用循环顶部捕获的陈旧 now——
+         * 跳页时 g_gtr_pending_at=millis() 比 now 大，now-at 会下溢成 ~4.29e9，
+         * 误触发 give_up 把动作立即丢弃（实测"GTR pending dropped"）。 */
+        if (g_gtr_pending >= 0) {
+            uint32_t now_ms   = millis();
+            uint32_t elapsed  = (now_ms >= g_gtr_pending_at)
+                                  ? (now_ms - g_gtr_pending_at) : 0;   /* 防下溢 */
+            bool give_up = elapsed > 2000;   /* 兜底：2s 还没上吉他页就丢弃 */
+            if ((ui_get_current_page() == 1 && elapsed >= 120) || give_up) {
+                int8_t p = g_gtr_pending;
+                g_gtr_pending = -1;
+                if (!give_up) {
+                    bool ok = false;
+                    if (Lvgl_lock(1000)) {
+                        if (p == 0)      ui_ambient_tap();
+                        else if (p == 1) ui_ambient_next_chord();
+                        else             ui_ambient_next_group();
+                        ok = true;
+                        Lvgl_unlock();
+                    }
+                    if (ok) {
+                        cam_client_send_gtr_ack(p);
+                        cam_client_log("[cmd] %s done (deferred)\n",
+                                       (p==0)?"GTR:STRUM":(p==1)?"GTR:CHORD":"GTR:GROUP");
+                    }
+                } else {
+                    cam_client_log("[cmd] GTR pending dropped (page switch failed)\n");
+                }
+            }
+        }
+    }
+
     /* 进入页面检测：进入吉他页触发雷达扫描 */
     {
         static uint8_t last_pg = 0xFF;
@@ -533,17 +713,9 @@ void loop()
         if (connected != g_wifi_prev) {
             g_wifi_prev = connected;
             if (connected) {
-                Serial.printf("WiFi connected, IP=%s\n", WiFi.localIP().toString().c_str());
-                /* 刚连上：立即拉取一次行情 + 直连天气 + 启动摄像头客户端 */
-                g_last_stocks = now;
-                fetch_stocks_data();         /* 行情：连上即拉一次 */
-                g_last_weather = now;
-                weather_result_t wr = fetch_weather_data();
-                g_weather_ready = (wr == WEATHER_OK);
-                g_weather_permanent = (wr == WEATHER_PERMANENT);
-                if (g_weather_ready) g_weather_fail_cnt = 0;
-                else g_weather_fail_cnt++;
-                cam_client_init();   // 幂等：内部防重复初始化，离线时任务自行退避重试
+                /* 首次连接/掉线重连的恢复统一走 wifi_on_connected()，
+                 * 避免与下方 30s 重连分支重复且不一致（Phase 2 P1） */
+                wifi_on_connected();
             } else {
                 Serial.println("WiFi disconnected");
             }

@@ -3,6 +3,8 @@
 #include <string.h>
 #include <freertos/FreeRTOS.h>
 #include <esp_log.h>
+#include <esp_err.h>
+#include <esp_heap_caps.h>
 #include "display_bsp.h"
 
 DisplayPort::DisplayPort(int mosi, int scl, int dc, int cs, int rst, int width, int height, spi_host_device_t spihost)
@@ -32,7 +34,9 @@ DisplayPort::DisplayPort(int mosi, int scl, int dc, int cs, int rst, int width, 
   io_config.lcd_cmd_bits = 8;
   io_config.lcd_param_bits = 8;
   io_config.spi_mode = 0;
-  io_config.trans_queue_depth = 10;
+  /* 8-31：10 -> 16。每帧要发 8 个事务（3 组窗口命令 + 2 字节参数 + 15000B 帧数据），
+   * 相机取帧与全屏刷新叠加时队列会瞬时排队，深度留足余量降低溢出概率。 */
+  io_config.trans_queue_depth = 16;
 
   ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)spihost, &io_config, &io_handle));
 
@@ -187,7 +191,7 @@ void DisplayPort::RLCD_ColorClear(uint8_t color) {
   memset(DispBuffer, color, DisplayLen);
 }
 
-void DisplayPort::RLCD_Display() {
+bool DisplayPort::RLCD_Display() {
   RLCD_SendCommand(0x2A);  // Column Address Set
   RLCD_SendData(0x12);
   RLCD_SendData(0x2A);
@@ -198,7 +202,7 @@ void DisplayPort::RLCD_Display() {
 
   RLCD_SendCommand(0x2c);  // Page Address Set
 
-  RLCD_Sendbuffera(DispBuffer, DisplayLen);
+  return RLCD_Sendbuffera(DispBuffer, DisplayLen);
 }
 
 void DisplayPort::RLCD_Reset(void) {
@@ -211,15 +215,60 @@ void DisplayPort::RLCD_Reset(void) {
 }
 
 void DisplayPort::RLCD_SendCommand(uint8_t Reg) {
-  ESP_ERROR_CHECK(esp_lcd_panel_io_tx_param(io_handle, Reg, NULL, 0));
+  esp_err_t err = esp_lcd_panel_io_tx_param(io_handle, Reg, NULL, 0);
+  if (err != ESP_OK) {
+    tx_fail_cnt++;
+    uint32_t now = millis();
+    if (now - last_tx_fail_ms > 5000) {
+      last_tx_fail_ms = now;
+      ESP_LOGE(TAG, "tx_param(cmd 0x%02X) fail x%u err=0x%x (%s) free=%u",
+               Reg, (unsigned)tx_fail_cnt, err, esp_err_to_name(err),
+               (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+      tx_fail_cnt = 0;
+    }
+  }
 }
 
 void DisplayPort::RLCD_SendData(uint8_t Data) {
-  ESP_ERROR_CHECK(esp_lcd_panel_io_tx_param(io_handle, -1, &Data, 1));
+  esp_err_t err = esp_lcd_panel_io_tx_param(io_handle, -1, &Data, 1);
+  if (err != ESP_OK) {
+    tx_fail_cnt++;
+    uint32_t now = millis();
+    if (now - last_tx_fail_ms > 5000) {
+      last_tx_fail_ms = now;
+      ESP_LOGE(TAG, "tx_param(data 0x%02X) fail x%u err=0x%x (%s) free=%u",
+               Data, (unsigned)tx_fail_cnt, err, esp_err_to_name(err),
+               (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+      tx_fail_cnt = 0;
+    }
+  }
 }
 
-void DisplayPort::RLCD_Sendbuffera(uint8_t *Data, int len) {
-  ESP_ERROR_CHECK(esp_lcd_panel_io_tx_color(io_handle, -1, Data, len));
+/* 8-31 关键修复：原实现是 ESP_ERROR_CHECK(...)，一旦 esp_lcd_panel_io_tx_color
+ * 返回 ESP_ERR_NO_MEM(0x101)（SPI 事务队列瞬时排满 / 临时 DMA 缓冲区分配失败）
+ * 就会 abort() -> 整机重启。实测与"切页次数"无关：有一次连续正常运行 361 秒
+ * 后才触发，另有几次上电后 28 秒即触发，说明是 SPI 背压的偶发事件，不是逻辑错误。
+ * 对策：退避重试，彻底失败则丢弃这一帧（反射屏保留上一帧内容），绝不重启。 */
+bool DisplayPort::RLCD_Sendbuffera(uint8_t *Data, int len) {
+  for (int attempt = 0; attempt < 4; ++attempt) {
+    esp_err_t err = esp_lcd_panel_io_tx_color(io_handle, -1, Data, len);
+    if (err == ESP_OK) return true;
+    if (attempt == 3) {
+      tx_fail_cnt++;
+      uint32_t now = millis();
+      if (now - last_tx_fail_ms > 5000) {
+        last_tx_fail_ms = now;
+        ESP_LOGE(TAG, "tx_color DROPPED x%u err=0x%x (%s) len=%d free=%u largest_dma=%u",
+                 (unsigned)tx_fail_cnt, err, esp_err_to_name(err), len,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+        tx_fail_cnt = 0;
+      }
+      return false;
+    }
+    vTaskDelay(pdMS_TO_TICKS(2 + attempt * 3));   // 2ms / 5ms / 8ms 退避
+  }
+  return false;
 }
 
 void DisplayPort::Set_ResetIOLevel(uint8_t level) {

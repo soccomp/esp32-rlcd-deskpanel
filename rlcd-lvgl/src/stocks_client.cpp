@@ -80,16 +80,20 @@ static String https_get(const char *host, const String &path,
     return body;
 }
 
-/* 提取以 '~' 分隔的第 idx 个字段（0-based），不存在返回空串 */
-static String field_at(const String &s, int idx)
+/* 提取以 sep 分隔的第 idx 个字段（0-based），不存在返回空串。
+ * ★ 8-20 修复：分隔符参数化——腾讯是 '~'，新浪是 ','。
+ * 旧实现硬编码 '~'，新浪数据上 indexOf('~') 恒返回 -1 → 新浪备用源
+ * 永远解析失败（腾讯失败后直接落到 Mac 后端，违背"腾讯→新浪→后端"
+ * 的降级意图）。两者格式见 fetch_tencent / fetch_sina 注释。 */
+static String field_at(const String &s, int idx, char sep = '~')
 {
     int pos = 0;
     for (int i = 0; i < idx; i++) {
-        pos = s.indexOf('~', pos);
+        pos = s.indexOf(sep, pos);
         if (pos < 0) return "";
         pos++;
     }
-    int end = s.indexOf('~', pos);
+    int end = s.indexOf(sep, pos);
     if (end < 0) end = s.length();
     return s.substring(pos, end);
 }
@@ -161,8 +165,8 @@ static void fetch_sina(void)
 
         String key     = body.substring(pos, eq);      /* "var hq_str_sh000001" */
         String payload = body.substring(q1 + 1, q2);
-        String cur  = field_at(payload, 3);            /* 现价 */
-        String prev = field_at(payload, 2);            /* 昨收 */
+        String cur  = field_at(payload, 3, ',');       /* 现价（, 分隔） */
+        String prev = field_at(payload, 2, ',');       /* 昨收（, 分隔） */
 
         float p = prev.toFloat();
         if (cur.length() > 0 && p != 0.0f) {
@@ -229,11 +233,54 @@ static bool fetch_backend_stocks(void)
     return g_quote_n > 0;
 }
 
-void fetch_stocks_data(void)
+/* 部分成功时用 SD 缓存补齐缺失行（8-31 修复 AI 行长期 "--"）。
+ * 场景：直连腾讯/新浪双源失败 → 走 Mac 后端代理；若后端只返回 3 行
+ * （例如旧版后端仍给 code=930713 的 AI 指数行，被上面跳过），
+ * fetch 整体算成功但 AI 行没有数据 → 该行一直停在 "--"，且缓存快照被
+ * 写成 3 行，后续重启也恢复不出 AI 行。
+ * 对策：缺失行从 SD 缓存补位（仅补名，绝不覆盖本次拿到的新数据），
+ * 保证四行始终有内容可渲染。 */
+static void stocks_fill_missing_from_cache(void)
+{
+    if (g_quote_n >= TX_IDX_N) return;
+    char *json = data_cache_load("stocks");
+    if (!json) return;
+
+    DynamicJsonDocument doc(1024);
+    if (deserializeJson(doc, json) != DeserializationError::Ok) { free(json); return; }
+    JsonArray arr = doc["stocks"].as<JsonArray>();
+    for (JsonObject s : arr) {
+        if (g_quote_n >= TX_IDX_N) break;
+        const char *nm = s["name"] | "";
+        if (!nm[0]) continue;
+        const char *cd = s["code"] | "";
+        if (cd[0] && strstr(cd, "930713")) continue;      /* 旧 AI 指数，量级不符 */
+        float v = s["value"] | 0.0f;
+        if (v == 0.0f) continue;                          /* 无效行不补 */
+        bool dup = false;
+        for (int i = 0; i < g_quote_n; i++) {
+            if (g_quotes[i].name && strcmp(g_quotes[i].name, nm) == 0) { dup = true; break; }
+        }
+        if (dup) continue;
+
+        strncpy(g_backend_names[g_quote_n], nm, sizeof(g_backend_names[0]) - 1);
+        g_backend_names[g_quote_n][sizeof(g_backend_names[0]) - 1] = '\0';
+        float pct = s["pct"] | 0.0f;
+        g_quotes[g_quote_n].name  = g_backend_names[g_quote_n];
+        g_quotes[g_quote_n].value = v;
+        g_quotes[g_quote_n].pct   = pct;
+        g_quotes[g_quote_n].up    = s["up"] | (pct >= 0);
+        g_quote_n++;
+        Serial.printf("[stocks] 缓存补位: %s %.2f\n", nm, v);
+    }
+    free(json);
+}
+
+bool fetch_stocks_data(void)
 {
     if (WiFi.status() != WL_CONNECTED) {
         Serial.println("Stocks fetch skipped: WiFi not connected");
-        return;
+        return false;
     }
 
     g_quote_n = 0;
@@ -254,9 +301,12 @@ void fetch_stocks_data(void)
         } else {
             Serial.println("[stocks] 后端代理也失败，恢复 SD 缓存");
             load_cached_stocks();
-            return;
+            return false;   /* P2: 仅旧缓存，非本槽位新数据 → 调用方不推进槽位 */
         }
     }
+
+    /* 8-31：部分成功（<4 行）时先用 SD 缓存补齐，再落盘/渲染 → 避免缺行长期 "--" */
+    if (g_quote_n > 0 && g_quote_n < TX_IDX_N) stocks_fill_missing_from_cache();
 
     /* 记录最近一次成功刷新时刻（NTP 未同步时 time() 为 1970，UI 侧会过滤） */
     ui_clock_set_stocks_time((uint32_t)time(NULL));
@@ -294,6 +344,7 @@ void fetch_stocks_data(void)
         Serial.println("[stocks] Lvgl_lock 超时，行情 UI 未刷新");
     }
     Serial.printf("[stocks] OK: %d quotes\n", g_quote_n);
+    return true;   /* P2: 拿到本槽位新行情 */
 }
 
 /* 从 SD 缓存恢复行情（直连失败时调用；无缓存则保持现状） */
